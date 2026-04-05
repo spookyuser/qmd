@@ -33,6 +33,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        packageJson = builtins.fromJSON (builtins.readFile ./package.json);
+        version = packageJson.version;
 
         # SQLite with loadable extension support for sqlite-vec
         sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
@@ -52,7 +54,7 @@
 
         nodeModules = pkgs.stdenvNoCC.mkDerivation {
           pname = "qmd-node-modules";
-          version = "1.0.0";
+          inherit version;
 
           src = ./.;
 
@@ -92,7 +94,7 @@
 
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
-          version = "1.0.0";
+          inherit version;
 
           src = ./.;
 
