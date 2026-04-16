@@ -1,9 +1,9 @@
 /**
- * QMD Store - Core data access and retrieval functions
+ * planet-capture Store - Core data access and retrieval functions
  *
- * This module provides all database operations, search functions, and document
- * retrieval for QMD. It returns raw data structures that can be formatted by
- * CLI or MCP consumers.
+ * This module provides all database operations, search functions, and page
+ * retrieval for planet-capture. It returns raw data structures that can be
+ * formatted by CLI or MCP consumers.
  *
  * Usage:
  *   const store = createStore("/path/to/db.sqlite");
@@ -13,11 +13,8 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
-import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
-// Note: node:path resolve is not imported — we export our own cross-platform resolve()
-import fastGlob from "fast-glob";
+import { mkdirSync } from "node:fs";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -27,12 +24,6 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
-import type {
-  NamedCollection,
-  Collection,
-  CollectionConfig,
-  ContextMap,
-} from "./collections.js";
 
 // =============================================================================
 // Configuration
@@ -42,7 +33,6 @@ const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
-export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
@@ -541,162 +531,9 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
-  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
-  const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
-  return resolve(qmdCacheDir, `${indexName}.sqlite`);
-}
-
-export function getPwd(): string {
-  return process.env.PWD || process.cwd();
-}
-
-export function getRealPath(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch {
-    return resolve(path);
-  }
-}
-
-// =============================================================================
-// Virtual Path Utilities (qmd://)
-// =============================================================================
-
-export type VirtualPath = {
-  collectionName: string;
-  path: string;  // relative path within collection
-  indexName?: string;
-};
-
-/**
- * Normalize explicit virtual path formats to standard qmd:// format.
- * Only handles paths that are already explicitly virtual:
- * - qmd://collection/path.md (already normalized)
- * - qmd:////collection/path.md (extra slashes - normalize)
- * - //collection/path.md (missing qmd: prefix - add it)
- *
- * Does NOT handle:
- * - collection/path.md (bare paths - could be filesystem relative)
- * - :linenum suffix (should be parsed separately before calling this)
- */
-export function normalizeVirtualPath(input: string): string {
-  let path = input.trim();
-
-  // Handle qmd:// with extra slashes: qmd:////collection/path -> qmd://collection/path
-  if (path.startsWith('qmd:')) {
-    // Remove qmd: prefix and normalize slashes
-    path = path.slice(4);
-    // Remove leading slashes and re-add exactly two
-    path = path.replace(/^\/+/, '');
-    return `qmd://${path}`;
-  }
-
-  // Handle //collection/path (missing qmd: prefix)
-  if (path.startsWith('//')) {
-    path = path.replace(/^\/+/, '');
-    return `qmd://${path}`;
-  }
-
-  // Return as-is for other cases (filesystem paths, docids, bare collection/path, etc.)
-  return path;
-}
-
-/**
- * Parse a virtual path like "qmd://collection-name/path/to/file.md"
- * into its components.
- * Also supports collection root: "qmd://collection-name/" or "qmd://collection-name"
- */
-export function parseVirtualPath(virtualPath: string): VirtualPath | null {
-  // Normalize the path first
-  const normalized = normalizeVirtualPath(virtualPath);
-  const [pathPart = normalized, queryString = ""] = normalized.split("?");
-
-  // Match: qmd://collection-name[/optional-path]
-  // Allows: qmd://name, qmd://name/, qmd://name/path
-  const match = pathPart.match(/^qmd:\/\/([^\/]+)\/?(.*)$/);
-  if (!match?.[1]) return null;
-  const indexName = new URLSearchParams(queryString).get("index")?.trim() || undefined;
-  return {
-    collectionName: match[1],
-    path: match[2] ?? '',  // Empty string for collection root
-    ...(indexName ? { indexName } : {}),
-  };
-}
-
-/**
- * Build a virtual path from collection name and relative path.
- */
-export function buildVirtualPath(collectionName: string, path: string, indexName?: string): string {
-  const base = `qmd://${collectionName}/${path}`;
-  return indexName ? `${base}?index=${encodeURIComponent(indexName)}` : base;
-}
-
-/**
- * Check if a path is explicitly a virtual path.
- * Only recognizes explicit virtual path formats:
- * - qmd://collection/path.md
- * - //collection/path.md
- *
- * Does NOT consider bare collection/path.md as virtual - that should be
- * handled separately by checking if the first component is a collection name.
- */
-export function isVirtualPath(path: string): boolean {
-  const trimmed = path.trim();
-
-  // Explicit qmd:// prefix (with any number of slashes)
-  if (trimmed.startsWith('qmd:')) return true;
-
-  // //collection/path format (missing qmd: prefix)
-  if (trimmed.startsWith('//')) return true;
-
-  return false;
-}
-
-/**
- * Resolve a virtual path to absolute filesystem path.
- */
-export function resolveVirtualPath(db: Database, virtualPath: string): string | null {
-  const parsed = parseVirtualPath(virtualPath);
-  if (!parsed) return null;
-
-  const coll = getCollectionByName(db, parsed.collectionName);
-  if (!coll) return null;
-
-  return resolve(coll.pwd, parsed.path);
-}
-
-/**
- * Convert an absolute filesystem path to a virtual path.
- * Returns null if the file is not in any indexed collection.
- */
-export function toVirtualPath(db: Database, absolutePath: string): string | null {
-  // Get all collections from DB
-  const collections = getStoreCollections(db);
-
-  // Find which collection this absolute path belongs to
-  for (const coll of collections) {
-    if (absolutePath.startsWith(coll.path + '/') || absolutePath === coll.path) {
-      // Extract relative path
-      const relativePath = absolutePath.startsWith(coll.path + '/')
-        ? absolutePath.slice(coll.path.length + 1)
-        : '';
-
-      // Verify this document exists in the database
-      const doc = db.prepare(`
-        SELECT d.path
-        FROM documents d
-        WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        LIMIT 1
-      `).get(coll.name, relativePath) as { path: string } | null;
-
-      if (doc) {
-        return buildVirtualPath(coll.name, relativePath);
-      }
-    }
-  }
-
-  return null;
+  const dataDir = process.env.PLANET_CAPTURE_DIR || resolve(homedir(), ".planet-capture");
+  try { mkdirSync(dataDir, { recursive: true }); } catch { }
+  return resolve(dataDir, `${indexName}.db`);
 }
 
 // =============================================================================
@@ -748,11 +585,7 @@ function initializeDatabase(db: Database): void {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
-  // Drop legacy tables that are now managed in YAML
-  db.exec(`DROP TABLE IF EXISTS path_contexts`);
-  db.exec(`DROP TABLE IF EXISTS collections`);
-
-  // Content-addressable storage - the source of truth for document content
+  // Content-addressable storage - the source of truth for page content
   db.exec(`
     CREATE TABLE IF NOT EXISTS content (
       hash TEXT PRIMARY KEY,
@@ -761,26 +594,76 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Documents table - file system layer mapping virtual paths to content hashes
-  // Collections are now managed in ~/.config/qmd/index.yml
+  // Pages table - maps URLs to fetched content
   db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
+    CREATE TABLE IF NOT EXISTS pages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      collection TEXT NOT NULL,
-      path TEXT NOT NULL,
-      title TEXT NOT NULL,
-      hash TEXT NOT NULL,
+      url TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL DEFAULT '',
+      hash TEXT,
+      fetch_status TEXT DEFAULT 'pending',
+      fetch_error TEXT,
+      fetched_at TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
-      UNIQUE(collection, path)
+      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE SET NULL
     )
   `);
 
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path, active)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pages_hash ON pages(hash)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pages_url ON pages(url)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_pages_status ON pages(fetch_status, active)`);
+
+  // Track which browsers contributed each URL
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_sources (
+      page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+      browser TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      visit_count INTEGER DEFAULT 0,
+      last_visit_time TEXT,
+      first_visit_time TEXT,
+      bookmark_folder TEXT,
+      PRIMARY KEY (page_id, browser, source_type)
+    )
+  `);
+
+  // Browser registry
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browsers (
+      name TEXT PRIMARY KEY,
+      history_path TEXT,
+      bookmarks_path TEXT,
+      detected_at TEXT NOT NULL,
+      last_synced_at TEXT,
+      enabled INTEGER DEFAULT 1
+    )
+  `);
+
+  // Indexer run tracking for resumability
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS indexer_state (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT DEFAULT 'running',
+      urls_discovered INTEGER DEFAULT 0,
+      urls_fetched INTEGER DEFAULT 0,
+      urls_skipped INTEGER DEFAULT 0,
+      urls_failed INTEGER DEFAULT 0,
+      last_processed_url TEXT
+    )
+  `);
+
+  // URL exclude/include filters (user-defined patterns)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS url_filters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pattern TEXT NOT NULL UNIQUE,
+      filter_type TEXT DEFAULT 'exclude'
+    )
+  `);
 
   // Cache table for LLM API calls
   db.exec(`
@@ -809,20 +692,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Store collections — makes the DB self-contained (no external config needed)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS store_collections (
-      name TEXT PRIMARY KEY,
-      path TEXT NOT NULL,
-      pattern TEXT NOT NULL DEFAULT '**/*.md',
-      ignore_patterns TEXT,
-      include_by_default INTEGER DEFAULT 1,
-      update_command TEXT,
-      context TEXT
-    )
-  `);
-
-  // Store config — key-value metadata (e.g. config_hash for sync optimization)
+  // Store config — key-value metadata
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_config (
       key TEXT PRIMARY KEY,
@@ -830,7 +700,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // FTS - index filepath (collection/path), title, and content
+  // FTS - filepath stores URL, body stores extracted text content
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
       filepath, title, body,
@@ -838,219 +708,276 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // Triggers to keep FTS in sync
+  // Triggers to keep FTS in sync with pages
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
-    WHEN new.active = 1
+    CREATE TRIGGER IF NOT EXISTS pages_ai AFTER INSERT ON pages
+    WHEN new.active = 1 AND new.hash IS NOT NULL
     BEGIN
       INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
+      SELECT new.id, new.url, new.title,
         (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
+      WHERE new.active = 1 AND new.hash IS NOT NULL;
     END
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    CREATE TRIGGER IF NOT EXISTS pages_ad AFTER DELETE ON pages BEGIN
       DELETE FROM documents_fts WHERE rowid = old.id;
     END
   `);
 
   db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages
     BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
+      DELETE FROM documents_fts WHERE rowid = old.id;
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT new.id, new.url, new.title,
         (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
+      WHERE new.active = 1 AND new.hash IS NOT NULL;
     END
   `);
 }
 
 // =============================================================================
-// Store Collections — DB accessor functions
+// Page CRUD operations
 // =============================================================================
 
-type StoreCollectionRow = {
-  name: string;
-  path: string;
-  pattern: string;
-  ignore_patterns: string | null;
-  include_by_default: number;
-  update_command: string | null;
-  context: string | null;
+/**
+ * Upsert a page by URL. Returns the page id (existing or new).
+ */
+export function upsertPage(
+  db: Database,
+  url: string,
+  title: string,
+  hash: string | null,
+  fetchStatus: string
+): number {
+  const now = new Date().toISOString();
+  const existing = db.prepare(`SELECT id, fetch_status FROM pages WHERE url = ?`).get(url) as { id: number; fetch_status: string } | null;
+
+  if (existing) {
+    // Update title if provided and not blank
+    if (title) {
+      db.prepare(`UPDATE pages SET title = ?, modified_at = ? WHERE id = ?`)
+        .run(title, now, existing.id);
+    }
+    // Only reset to pending if currently not fetched
+    if (fetchStatus === "pending" && existing.fetch_status !== "fetched") {
+      db.prepare(`UPDATE pages SET fetch_status = 'pending', modified_at = ? WHERE id = ?`)
+        .run(now, existing.id);
+    }
+    return existing.id;
+  }
+
+  const result = db.prepare(`
+    INSERT INTO pages (url, title, hash, fetch_status, active, created_at, modified_at)
+    VALUES (?, ?, ?, ?, 1, ?, ?)
+  `).run(url, title, hash, fetchStatus, now, now);
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * Upsert a page_source entry (which browser/type contributed this URL).
+ */
+export function upsertPageSource(
+  db: Database,
+  pageId: number,
+  browser: string,
+  sourceType: string,
+  visitCount: number,
+  lastVisitTime: string | null,
+  bookmarkFolder?: string
+): void {
+  db.prepare(`
+    INSERT INTO page_sources (page_id, browser, source_type, visit_count, last_visit_time, bookmark_folder)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(page_id, browser, source_type) DO UPDATE SET
+      visit_count = MAX(excluded.visit_count, visit_count),
+      last_visit_time = CASE
+        WHEN excluded.last_visit_time > last_visit_time THEN excluded.last_visit_time
+        ELSE last_visit_time
+      END,
+      bookmark_folder = COALESCE(excluded.bookmark_folder, bookmark_folder)
+  `).run(pageId, browser, sourceType, visitCount, lastVisitTime, bookmarkFolder ?? null);
+}
+
+/**
+ * Update a page after fetching (content hash, title, status).
+ */
+export function updatePageFetchResult(
+  db: Database,
+  url: string,
+  hash: string | null,
+  title: string,
+  fetchStatus: string,
+  fetchError?: string
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE pages SET
+      hash = ?,
+      title = CASE WHEN ? != '' THEN ? ELSE title END,
+      fetch_status = ?,
+      fetch_error = ?,
+      fetched_at = ?,
+      modified_at = ?
+    WHERE url = ?
+  `).run(hash, title, title, fetchStatus, fetchError ?? null, fetchStatus === "fetched" ? now : null, now, url);
+}
+
+/**
+ * Get pending pages (not yet fetched or previously failed).
+ * Ordered by most recently visited first.
+ */
+export function getPendingPages(
+  db: Database,
+  limit: number = 1000
+): { id: number; url: string; title: string }[] {
+  return db.prepare(`
+    SELECT p.id, p.url, p.title
+    FROM pages p
+    LEFT JOIN (
+      SELECT page_id, MAX(last_visit_time) as last_visit
+      FROM page_sources
+      GROUP BY page_id
+    ) ps ON ps.page_id = p.id
+    WHERE p.active = 1 AND p.fetch_status IN ('pending', 'failed')
+    ORDER BY ps.last_visit DESC NULLS LAST
+    LIMIT ?
+  `).all(limit) as { id: number; url: string; title: string }[];
+}
+
+/**
+ * Get a page by URL.
+ */
+export function getPageByUrl(
+  db: Database,
+  url: string
+): { id: number; hash: string | null; title: string; fetch_status: string } | null {
+  return db.prepare(`
+    SELECT id, hash, title, fetch_status FROM pages WHERE url = ?
+  `).get(url) as { id: number; hash: string | null; title: string; fetch_status: string } | null;
+}
+
+// =============================================================================
+// Browser registry operations
+// =============================================================================
+
+/**
+ * Register or update a browser in the registry.
+ */
+export function upsertBrowser(
+  db: Database,
+  name: string,
+  historyPath: string | null,
+  bookmarksPath: string | null
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO browsers (name, history_path, bookmarks_path, detected_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      history_path = excluded.history_path,
+      bookmarks_path = excluded.bookmarks_path
+  `).run(name, historyPath, bookmarksPath, now);
+}
+
+/**
+ * Get all registered browsers.
+ */
+export function getBrowsers(db: Database): {
+  name: string; history_path: string | null; bookmarks_path: string | null;
+  detected_at: string; last_synced_at: string | null; enabled: number;
+}[] {
+  return db.prepare(`SELECT * FROM browsers`).all() as any[];
+}
+
+/**
+ * Update the last_synced_at timestamp for a browser.
+ */
+export function updateBrowserSyncTime(db: Database, name: string): void {
+  db.prepare(`UPDATE browsers SET last_synced_at = ? WHERE name = ?`).run(new Date().toISOString(), name);
+}
+
+// =============================================================================
+// URL filter operations
+// =============================================================================
+
+/**
+ * Get all exclude filter patterns.
+ */
+export function getExcludeFilters(db: Database): string[] {
+  const rows = db.prepare(`SELECT pattern FROM url_filters WHERE filter_type = 'exclude'`).all() as { pattern: string }[];
+  return rows.map(r => r.pattern);
+}
+
+/**
+ * Add a URL filter pattern.
+ */
+export function addUrlFilter(db: Database, pattern: string, filterType: string = "exclude"): void {
+  db.prepare(`INSERT OR IGNORE INTO url_filters (pattern, filter_type) VALUES (?, ?)`).run(pattern, filterType);
+}
+
+/**
+ * Remove a URL filter pattern. Returns true if removed.
+ */
+export function removeUrlFilter(db: Database, pattern: string): boolean {
+  const result = db.prepare(`DELETE FROM url_filters WHERE pattern = ?`).run(pattern);
+  return result.changes > 0;
+}
+
+/**
+ * List all URL filters.
+ */
+export function listUrlFilters(db: Database): { id: number; pattern: string; filter_type: string }[] {
+  return db.prepare(`SELECT id, pattern, filter_type FROM url_filters ORDER BY id`).all() as any[];
+}
+
+// =============================================================================
+// Indexer state operations
+// =============================================================================
+
+export type IndexerRunState = {
+  id?: number;
+  started_at?: string;
+  completed_at?: string | null;
+  status?: string;
+  urls_discovered?: number;
+  urls_fetched?: number;
+  urls_skipped?: number;
+  urls_failed?: number;
+  last_processed_url?: string | null;
 };
 
-function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
-  return {
-    name: row.name,
-    path: row.path,
-    pattern: row.pattern,
-    ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
-    ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
-    ...(row.update_command ? { update: row.update_command } : {}),
-    ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
-  };
+/**
+ * Create a new indexer run and return its id.
+ */
+export function createIndexerRun(db: Database): number {
+  const result = db.prepare(`INSERT INTO indexer_state (started_at, status) VALUES (?, 'running')`).run(new Date().toISOString());
+  return Number(result.lastInsertRowid);
 }
 
-export function getStoreCollections(db: Database): NamedCollection[] {
-  const rows = db.prepare(`SELECT * FROM store_collections`).all() as StoreCollectionRow[];
-  return rows.map(rowToNamedCollection);
-}
-
-export function getStoreCollection(db: Database, name: string): NamedCollection | null {
-  const row = db.prepare(`SELECT * FROM store_collections WHERE name = ?`).get(name) as StoreCollectionRow | null | undefined;
-  if (row == null) return null;
-  return rowToNamedCollection(row);
-}
-
-export function getStoreGlobalContext(db: Database): string | undefined {
-  const row = db.prepare(`SELECT value FROM store_config WHERE key = 'global_context'`).get() as { value: string } | null | undefined;
-  if (row == null) return undefined;
-  return row.value || undefined;
-}
-
-export function getStoreContexts(db: Database): Array<{ collection: string; path: string; context: string }> {
-  const results: Array<{ collection: string; path: string; context: string }> = [];
-
-  // Global context
-  const globalCtx = getStoreGlobalContext(db);
-  if (globalCtx) {
-    results.push({ collection: "*", path: "/", context: globalCtx });
-  }
-
-  // Collection contexts
-  const rows = db.prepare(`SELECT name, context FROM store_collections WHERE context IS NOT NULL`).all() as { name: string; context: string }[];
-  for (const row of rows) {
-    const ctxMap = JSON.parse(row.context) as ContextMap;
-    for (const [path, context] of Object.entries(ctxMap)) {
-      results.push({ collection: row.name, path, context });
-    }
-  }
-
-  return results;
-}
-
-export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
-  db.prepare(`
-    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(name) DO UPDATE SET
-      path = excluded.path,
-      pattern = excluded.pattern,
-      ignore_patterns = excluded.ignore_patterns,
-      include_by_default = excluded.include_by_default,
-      update_command = excluded.update_command,
-      context = excluded.context
-  `).run(
-    name,
-    collection.path,
-    collection.pattern || '**/*.md',
-    collection.ignore ? JSON.stringify(collection.ignore) : null,
-    collection.includeByDefault === false ? 0 : 1,
-    collection.update || null,
-    collection.context ? JSON.stringify(collection.context) : null,
-  );
-}
-
-export function deleteStoreCollection(db: Database, name: string): boolean {
-  const result = db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(name);
-  return result.changes > 0;
-}
-
-export function renameStoreCollection(db: Database, oldName: string, newName: string): boolean {
-  // Check target doesn't exist
-  const existing = db.prepare(`SELECT name FROM store_collections WHERE name = ?`).get(newName) as { name: string } | null | undefined;
-  if (existing != null) {
-    throw new Error(`Collection '${newName}' already exists`);
-  }
-
-  const result = db.prepare(`UPDATE store_collections SET name = ? WHERE name = ?`).run(newName, oldName);
-  return result.changes > 0;
-}
-
-export function updateStoreContext(db: Database, collectionName: string, path: string, text: string): boolean {
-  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
-  if (row == null) return false;
-
-  const ctxMap: ContextMap = row.context ? JSON.parse(row.context) : {};
-  ctxMap[path] = text;
-  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(JSON.stringify(ctxMap), collectionName);
-  return true;
-}
-
-export function removeStoreContext(db: Database, collectionName: string, path: string): boolean {
-  const row = db.prepare(`SELECT context FROM store_collections WHERE name = ?`).get(collectionName) as { context: string | null } | null | undefined;
-  if (row == null) return false;
-  if (!row.context) return false;
-
-  const ctxMap: ContextMap = JSON.parse(row.context);
-  if (!(path in ctxMap)) return false;
-
-  delete ctxMap[path];
-  const newCtx = Object.keys(ctxMap).length > 0 ? JSON.stringify(ctxMap) : null;
-  db.prepare(`UPDATE store_collections SET context = ? WHERE name = ?`).run(newCtx, collectionName);
-  return true;
-}
-
-export function setStoreGlobalContext(db: Database, value: string | undefined): void {
-  if (value === undefined) {
-    db.prepare(`DELETE FROM store_config WHERE key = 'global_context'`).run();
-  } else {
-    db.prepare(`INSERT INTO store_config (key, value) VALUES ('global_context', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(value);
+/**
+ * Update an existing indexer run's state.
+ */
+export function updateIndexerRun(db: Database, id: number, updates: Partial<IndexerRunState>): void {
+  const fields = Object.entries(updates)
+    .filter(([k]) => k !== "id")
+    .map(([k]) => `${k} = ?`).join(", ");
+  const values = Object.entries(updates)
+    .filter(([k]) => k !== "id")
+    .map(([, v]) => v);
+  if (fields) {
+    db.prepare(`UPDATE indexer_state SET ${fields} WHERE id = ?`).run(...values, id);
   }
 }
 
 /**
- * Sync external config (YAML/inline) into SQLite store_collections.
- * External config always wins. Skips sync if config hash hasn't changed.
+ * Get the last indexer run.
  */
-export function syncConfigToDb(db: Database, config: CollectionConfig): void {
-  // Check config hash — skip sync if unchanged
-  const configJson = JSON.stringify(config);
-  const hash = createHash('sha256').update(configJson).digest('hex');
-
-  const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
-  if (existingHash != null && existingHash.value === hash) {
-    return; // Config unchanged, skip sync
-  }
-
-  // Sync collections
-  const configNames = new Set(Object.keys(config.collections));
-
-  for (const [name, coll] of Object.entries(config.collections)) {
-    upsertStoreCollection(db, name, coll);
-  }
-
-  // Delete collections not in config
-  const dbCollections = db.prepare(`SELECT name FROM store_collections`).all() as { name: string }[];
-  for (const row of dbCollections) {
-    if (!configNames.has(row.name)) {
-      db.prepare(`DELETE FROM store_collections WHERE name = ?`).run(row.name);
-    }
-  }
-
-  // Sync global context
-  if (config.global_context !== undefined) {
-    setStoreGlobalContext(db, config.global_context);
-  } else {
-    setStoreGlobalContext(db, undefined);
-  }
-
-  // Save config hash
-  db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
+export function getLastIndexerRun(db: Database): IndexerRunState | null {
+  return db.prepare(`SELECT * FROM indexer_state ORDER BY id DESC LIMIT 1`).get() as IndexerRunState | null;
 }
-
 
 export function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
@@ -1105,52 +1032,54 @@ export type Store = {
 
   // Cleanup and maintenance
   deleteLLMCache: () => number;
-  deleteInactiveDocuments: () => number;
+  deleteInactivePages: () => number;
   cleanupOrphanedContent: () => number;
   cleanupOrphanedVectors: () => number;
   vacuumDatabase: () => void;
 
-  // Context
-  getContextForFile: (filepath: string) => string | null;
-  getContextForPath: (collectionName: string, path: string) => string | null;
-  getCollectionByName: (name: string) => { name: string; pwd: string; glob_pattern: string } | null;
-  getCollectionsWithoutContext: () => { name: string; pwd: string; doc_count: number }[];
-  getTopLevelPathsWithoutContext: (collectionName: string) => string[];
-
-  // Virtual paths
-  parseVirtualPath: typeof parseVirtualPath;
-  buildVirtualPath: typeof buildVirtualPath;
-  isVirtualPath: typeof isVirtualPath;
-  resolveVirtualPath: (virtualPath: string) => string | null;
-  toVirtualPath: (absolutePath: string) => string | null;
+  // No-op context stub (pages have no context system)
+  getContextForFile: (url: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, browser?: string) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, browser?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
 
-  // Document retrieval
-  findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
-  getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => string | null;
-  findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => { docs: MultiGetResult[]; errors: string[] };
+  // Page retrieval
+  findPage: (urlOrDocid: string, options?: { includeBody?: boolean }) => PageResult | PageNotFound;
+  getPageBody: (page: PageResult | { url: string }, fromLine?: number, maxLines?: number) => string | null;
 
-  // Fuzzy matching and docid lookup
-  findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => string[];
-  matchFilesByGlob: (pattern: string) => { filepath: string; displayPath: string; bodyLength: number }[];
-  findDocumentByDocid: (docid: string) => { filepath: string; hash: string } | null;
+  // Page operations
+  upsertPage: (url: string, title: string, hash: string | null, fetchStatus: string) => number;
+  upsertPageSource: (pageId: number, browser: string, sourceType: string, visitCount: number, lastVisitTime: string | null, bookmarkFolder?: string) => void;
+  updatePageFetchResult: (url: string, hash: string | null, title: string, fetchStatus: string, fetchError?: string) => void;
+  getPendingPages: (limit?: number) => { id: number; url: string; title: string }[];
+  getPageByUrl: (url: string) => { id: number; hash: string | null; title: string; fetch_status: string } | null;
 
-  // Document indexing operations
+  // Browser operations
+  upsertBrowser: (name: string, historyPath: string | null, bookmarksPath: string | null) => void;
+  getBrowsers: () => { name: string; history_path: string | null; bookmarks_path: string | null; detected_at: string; last_synced_at: string | null; enabled: number }[];
+  updateBrowserSyncTime: (name: string) => void;
+
+  // URL filter operations
+  getExcludeFilters: () => string[];
+  addUrlFilter: (pattern: string, filterType?: string) => void;
+  removeUrlFilter: (pattern: string) => boolean;
+  listUrlFilters: () => { id: number; pattern: string; filter_type: string }[];
+
+  // Indexer state
+  createIndexerRun: () => number;
+  updateIndexerRun: (id: number, updates: Partial<IndexerRunState>) => void;
+  getLastIndexerRun: () => IndexerRunState | null;
+
+  // Docid lookup
+  findPageByDocid: (docid: string) => { url: string; hash: string } | null;
+
+  // Content operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
-  insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
-  findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
-  updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
-  updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionName: string, path: string) => void;
-  getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
@@ -1159,128 +1088,8 @@ export type Store = {
 };
 
 // =============================================================================
-// Reindex & Embed — pure-logic functions for SDK and CLI
+// Embed — pure-logic functions for SDK and CLI
 // =============================================================================
-
-export type ReindexProgress = {
-  file: string;
-  current: number;
-  total: number;
-};
-
-export type ReindexResult = {
-  indexed: number;
-  updated: number;
-  unchanged: number;
-  removed: number;
-  orphanedCleaned: number;
-};
-
-/**
- * Re-index a single collection by scanning the filesystem and updating the database.
- * Pure function — no console output, no db lifecycle management.
- */
-export async function reindexCollection(
-  store: Store,
-  collectionPath: string,
-  globPattern: string,
-  collectionName: string,
-  options?: {
-    ignorePatterns?: string[];
-    onProgress?: (info: ReindexProgress) => void;
-  }
-): Promise<ReindexResult> {
-  const db = store.db;
-  const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
-
-  const allIgnore = [
-    ...excludeDirs.map(d => `**/${d}/**`),
-    ...(options?.ignorePatterns || []),
-  ];
-  const allFiles: string[] = await fastGlob(globPattern, {
-    cwd: collectionPath,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: allIgnore,
-  });
-  // Filter hidden files/folders
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
-
-  const total = files.length;
-  let indexed = 0, updated = 0, unchanged = 0, processed = 0;
-  const seenPaths = new Set<string>();
-
-  for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
-    const path = handelize(relativeFile);
-    seenPaths.add(path);
-
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch {
-      processed++;
-      options?.onProgress?.({ file: relativeFile, current: processed, total });
-      continue;
-    }
-
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
-
-    if (existing) {
-      if (existing.hash === hash) {
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-      } else {
-        insertContent(db, hash, content, now);
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
-      }
-    } else {
-      indexed++;
-      insertContent(db, hash, content, now);
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-    }
-
-    processed++;
-    options?.onProgress?.({ file: relativeFile, current: processed, total });
-  }
-
-  // Deactivate documents that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
-  let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
-    }
-  }
-
-  const orphanedCleaned = cleanupOrphanedContent(db);
-
-  return { indexed, updated, unchanged, removed, orphanedCleaned };
-}
 
 export type EmbedProgress = {
   chunksEmbedded: number;
@@ -1343,13 +1152,13 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
 
 function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
   return db.prepare(`
-    SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-    GROUP BY d.hash
-    ORDER BY MIN(d.path)
+    SELECT p.hash, MIN(p.url) as path, length(CAST(c.doc AS BLOB)) as bytes
+    FROM pages p
+    JOIN content c ON p.hash = c.hash
+    LEFT JOIN content_vectors v ON p.hash = v.hash AND v.seq = 0
+    WHERE p.active = 1 AND p.hash IS NOT NULL AND p.fetch_status = 'fetched' AND v.hash IS NULL
+    GROUP BY p.hash
+    ORDER BY MIN(p.url)
   `).all() as PendingEmbeddingDoc[];
 }
 
@@ -1457,7 +1266,10 @@ export async function generateEmbeddings(
       for (const doc of batchDocs) {
         if (!doc.body.trim()) continue;
 
-        const title = extractTitle(doc.body, doc.path);
+        // For pages, use the title from the pages table (derived from <title>),
+        // falling back to the URL if not set.
+        const titleRow = db.prepare(`SELECT title FROM pages WHERE hash = ? AND active = 1 LIMIT 1`).get(doc.hash) as { title: string } | null;
+        const title = titleRow?.title || doc.path;
         const chunks = await chunkDocumentByTokens(
           doc.body,
           undefined, undefined, undefined,
@@ -1619,52 +1431,54 @@ export function createStore(dbPath?: string): Store {
 
     // Cleanup and maintenance
     deleteLLMCache: () => deleteLLMCache(db),
-    deleteInactiveDocuments: () => deleteInactiveDocuments(db),
+    deleteInactivePages: () => deleteInactivePages(db),
     cleanupOrphanedContent: () => cleanupOrphanedContent(db),
     cleanupOrphanedVectors: () => cleanupOrphanedVectors(db),
     vacuumDatabase: () => vacuumDatabase(db),
 
-    // Context
-    getContextForFile: (filepath: string) => getContextForFile(db, filepath),
-    getContextForPath: (collectionName: string, path: string) => getContextForPath(db, collectionName, path),
-    getCollectionByName: (name: string) => getCollectionByName(db, name),
-    getCollectionsWithoutContext: () => getCollectionsWithoutContext(db),
-    getTopLevelPathsWithoutContext: (collectionName: string) => getTopLevelPathsWithoutContext(db, collectionName),
-
-    // Virtual paths
-    parseVirtualPath,
-    buildVirtualPath,
-    isVirtualPath,
-    resolveVirtualPath: (virtualPath: string) => resolveVirtualPath(db, virtualPath),
-    toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
+    // No-op context stub (pages have no context system)
+    getContextForFile: (_url: string) => null,
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, browser?: string) => searchFTS(db, query, limit, browser),
+    searchVec: (query: string, model: string, limit?: number, browser?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, browser, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
 
-    // Document retrieval
-    findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
-    getDocumentBody: (doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number) => getDocumentBody(db, doc, fromLine, maxLines),
-    findDocuments: (pattern: string, options?: { includeBody?: boolean; maxBytes?: number }) => findDocuments(db, pattern, options),
+    // Page retrieval
+    findPage: (urlOrDocid: string, options?: { includeBody?: boolean }) => findPage(db, urlOrDocid, options),
+    getPageBody: (page: PageResult | { url: string }, fromLine?: number, maxLines?: number) => getPageBody(db, page, fromLine, maxLines),
 
-    // Fuzzy matching and docid lookup
-    findSimilarFiles: (query: string, maxDistance?: number, limit?: number) => findSimilarFiles(db, query, maxDistance, limit),
-    matchFilesByGlob: (pattern: string) => matchFilesByGlob(db, pattern),
-    findDocumentByDocid: (docid: string) => findDocumentByDocid(db, docid),
+    // Page operations
+    upsertPage: (url: string, title: string, hash: string | null, fetchStatus: string) => upsertPage(db, url, title, hash, fetchStatus),
+    upsertPageSource: (pageId: number, browser: string, sourceType: string, visitCount: number, lastVisitTime: string | null, bookmarkFolder?: string) => upsertPageSource(db, pageId, browser, sourceType, visitCount, lastVisitTime, bookmarkFolder),
+    updatePageFetchResult: (url: string, hash: string | null, title: string, fetchStatus: string, fetchError?: string) => updatePageFetchResult(db, url, hash, title, fetchStatus, fetchError),
+    getPendingPages: (limit?: number) => getPendingPages(db, limit),
+    getPageByUrl: (url: string) => getPageByUrl(db, url),
 
-    // Document indexing operations
+    // Browser operations
+    upsertBrowser: (name: string, historyPath: string | null, bookmarksPath: string | null) => upsertBrowser(db, name, historyPath, bookmarksPath),
+    getBrowsers: () => getBrowsers(db),
+    updateBrowserSyncTime: (name: string) => updateBrowserSyncTime(db, name),
+
+    // URL filter operations
+    getExcludeFilters: () => getExcludeFilters(db),
+    addUrlFilter: (pattern: string, filterType?: string) => addUrlFilter(db, pattern, filterType),
+    removeUrlFilter: (pattern: string) => removeUrlFilter(db, pattern),
+    listUrlFilters: () => listUrlFilters(db),
+
+    // Indexer state
+    createIndexerRun: () => createIndexerRun(db),
+    updateIndexerRun: (id: number, updates: Partial<IndexerRunState>) => updateIndexerRun(db, id, updates),
+    getLastIndexerRun: () => getLastIndexerRun(db),
+
+    // Docid lookup
+    findPageByDocid: (docid: string) => findPageByDocid(db, docid),
+
+    // Content operations
     insertContent: (hash: string, content: string, createdAt: string) => insertContent(db, hash, content, createdAt),
-    insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => insertDocument(db, collectionName, path, title, hash, createdAt, modifiedAt),
-    findActiveDocument: (collectionName: string, path: string) => findActiveDocument(db, collectionName, path),
-    findOrMigrateLegacyDocument: (collectionName: string, path: string) => findOrMigrateLegacyDocument(db, collectionName, path),
-    updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => updateDocumentTitle(db, documentId, title, modifiedAt),
-    updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => updateDocument(db, documentId, title, hash, modifiedAt),
-    deactivateDocument: (collectionName: string, path: string) => deactivateDocument(db, collectionName, path),
-    getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
     getHashesForEmbedding: () => getHashesForEmbedding(db),
@@ -1676,24 +1490,25 @@ export function createStore(dbPath?: string): Store {
 }
 
 // =============================================================================
-// Core Document Type
+// Core Page Type
 // =============================================================================
 
 /**
- * Unified document result type with all metadata.
- * Body is optional - use getDocumentBody() to load it separately if needed.
+ * Unified page result type with all metadata.
+ * Body is optional - use getPageBody() to load it separately if needed.
  */
-export type DocumentResult = {
-  filepath: string;           // Full filesystem path
-  displayPath: string;        // Short display path (e.g., "docs/readme.md")
-  title: string;              // Document title (from first heading or filename)
-  context: string | null;     // Folder context description if configured
+export type PageResult = {
+  url: string;                // Canonical URL
+  title: string;              // Page title (from <title> or og:title)
   hash: string;               // Content hash for caching/change detection
   docid: string;              // Short docid (first 6 chars of hash) for quick reference
-  collectionName: string;     // Parent collection name
+  browsers: string[];         // Browsers this URL came from (e.g., ["chrome", "arc"])
+  visitCount: number;         // Total visit count across browsers
+  fetchStatus: string;        // "pending" | "fetched" | "failed" | "skipped"
+  fetchedAt: string | null;   // When the page was last fetched
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
-  body?: string;              // Document body (optional, load with getDocumentBody)
+  body?: string;              // Extracted text (optional, load with getPageBody)
 };
 
 /**
@@ -1704,79 +1519,9 @@ export function getDocid(hash: string): string {
 }
 
 /**
- * Handelize a filename to be more token-friendly.
- * - Convert triple underscore `___` to `/` (folder separator)
- * - Replace sequences of non-word chars (except /) with single dash
- * - Remove leading/trailing dashes from path segments
- * - Preserve folder structure (a/b/c/d.md stays structured)
- * - Preserve file extension
- * - Preserve original case (important for case-sensitive filesystems)
+ * Search result extends PageResult with score and source info
  */
-/** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
-function emojiToHex(str: string): string {
-  return str.replace(/(?:\p{So}\p{Mn}?|\p{Sk})+/gu, (run) => {
-    // Split the run into individual emoji and convert each to hex, dash-separated
-    return [...run].filter(c => /\p{So}|\p{Sk}/u.test(c))
-      .map(c => c.codePointAt(0)!.toString(16)).join('-');
-  });
-}
-
-export function handelize(path: string): string {
-  if (!path || path.trim() === '') {
-    throw new Error('handelize: path cannot be empty');
-  }
-
-  // Allow route-style "$" filenames while still rejecting paths with no usable content.
-  // Emoji (\p{So}) counts as valid content — they get converted to hex codepoints below.
-  const segments = path.split('/').filter(Boolean);
-  const lastSegment = segments[segments.length - 1] || '';
-  const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}\p{So}\p{Sk}$]/u.test(filenameWithoutExt);
-  if (!hasValidContent) {
-    throw new Error(`handelize: path "${path}" has no valid filename content`);
-  }
-
-  const result = path
-    .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .split('/')
-    .map((segment, idx, arr) => {
-      const isLastSegment = idx === arr.length - 1;
-
-      // Convert emoji to hex codepoints before cleaning
-      segment = emojiToHex(segment);
-
-      if (isLastSegment) {
-        // For the filename (last segment), preserve the extension
-        const extMatch = segment.match(/(\.[a-z0-9]+)$/i);
-        const ext = extMatch ? extMatch[1] : '';
-        const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
-
-        const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep letters, numbers, "$"; dash-separate rest (including dots)
-          .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
-
-        return cleanedName + ext;
-      } else {
-        // For directories, just clean normally
-        return segment
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')
-          .replace(/^-+|-+$/g, '');
-      }
-    })
-    .filter(Boolean)
-    .join('/');
-
-  if (!result) {
-    throw new Error(`handelize: path "${path}" resulted in empty string after processing`);
-  }
-
-  return result;
-}
-
-/**
- * Search result extends DocumentResult with score and source info
- */
-export type SearchResult = DocumentResult & {
+export type SearchResult = PageResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
@@ -1829,39 +1574,44 @@ export type HybridQueryExplain = {
 };
 
 /**
- * Error result when document is not found
+ * Error result when page is not found
  */
-export type DocumentNotFound = {
+export type PageNotFound = {
   error: "not_found";
   query: string;
-  similarFiles: string[];
+  similarUrls: string[];
 };
 
 /**
  * Result from multi-get operations
  */
 export type MultiGetResult = {
-  doc: DocumentResult;
+  page: PageResult;
   skipped: false;
 } | {
-  doc: Pick<DocumentResult, "filepath" | "displayPath">;
+  page: Pick<PageResult, "url">;
   skipped: true;
   skipReason: string;
 };
 
-export type CollectionInfo = {
+export type BrowserInfo = {
   name: string;
-  path: string | null;
-  pattern: string | null;
-  documents: number;
-  lastUpdated: string;
+  historyPath: string | null;
+  bookmarksPath: string | null;
+  detectedAt: string;
+  lastSyncedAt: string | null;
+  pages: number;
 };
 
 export type IndexStatus = {
-  totalDocuments: number;
+  totalPages: number;
+  fetchedPages: number;
+  pendingPages: number;
+  failedPages: number;
   needsEmbedding: number;
   hasVectorIndex: boolean;
-  collections: CollectionInfo[];
+  browsers: BrowserInfo[];
+  lastRun: IndexerRunState | null;
 };
 
 // =============================================================================
@@ -1870,10 +1620,10 @@ export type IndexStatus = {
 
 export function getHashesNeedingEmbedding(db: Database): number {
   const result = db.prepare(`
-    SELECT COUNT(DISTINCT d.hash) as count
-    FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
+    SELECT COUNT(DISTINCT p.hash) as count
+    FROM pages p
+    LEFT JOIN content_vectors v ON p.hash = v.hash AND v.seq = 0
+    WHERE p.active = 1 AND p.hash IS NOT NULL AND p.fetch_status = 'fetched' AND v.hash IS NULL
   `).get() as { count: number };
   return result.count;
 }
@@ -1886,9 +1636,9 @@ export type IndexHealthInfo = {
 
 export function getIndexHealth(db: Database): IndexHealthInfo {
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
+  const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM pages WHERE active = 1 AND fetch_status = 'fetched'`).get() as { count: number }).count;
 
-  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM pages WHERE active = 1`).get() as { latest: string | null };
   let daysStale: number | null = null;
   if (mostRecent?.latest) {
     const lastUpdate = new Date(mostRecent.latest);
@@ -1940,28 +1690,28 @@ export function deleteLLMCache(db: Database): number {
 }
 
 /**
- * Remove inactive document records (active = 0).
- * Returns the number of inactive documents deleted.
+ * Remove inactive page records (active = 0).
+ * Returns the number of inactive pages deleted.
  */
-export function deleteInactiveDocuments(db: Database): number {
-  const result = db.prepare(`DELETE FROM documents WHERE active = 0`).run();
+export function deleteInactivePages(db: Database): number {
+  const result = db.prepare(`DELETE FROM pages WHERE active = 0`).run();
   return result.changes;
 }
 
 /**
- * Remove orphaned content hashes that are not referenced by any active document.
+ * Remove orphaned content hashes that are not referenced by any active page.
  * Returns the number of orphaned content hashes deleted.
  */
 export function cleanupOrphanedContent(db: Database): number {
   const result = db.prepare(`
     DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    WHERE hash NOT IN (SELECT DISTINCT hash FROM pages WHERE active = 1 AND hash IS NOT NULL)
   `).run();
   return result.changes;
 }
 
 /**
- * Remove orphaned vector embeddings that are not referenced by any active document.
+ * Remove orphaned vector embeddings that are not referenced by any active page.
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
@@ -1986,7 +1736,7 @@ export function cleanupOrphanedVectors(db: Database): number {
   const countResult = db.prepare(`
     SELECT COUNT(*) as c FROM content_vectors cv
     WHERE NOT EXISTS (
-      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+      SELECT 1 FROM pages p WHERE p.hash = cv.hash AND p.active = 1
     )
   `).get() as { c: number };
 
@@ -1999,7 +1749,7 @@ export function cleanupOrphanedVectors(db: Database): number {
     DELETE FROM vectors_vec WHERE hash_seq IN (
       SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
       WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        SELECT 1 FROM pages p WHERE p.hash = cv.hash AND p.active = 1
       )
     )
   `);
@@ -2007,7 +1757,7 @@ export function cleanupOrphanedVectors(db: Database): number {
   // Delete from content_vectors
   db.exec(`
     DELETE FROM content_vectors WHERE hash NOT IN (
-      SELECT hash FROM documents WHERE active = 1
+      SELECT hash FROM pages WHERE active = 1 AND hash IS NOT NULL
     )
   `);
 
@@ -2026,7 +1776,7 @@ export function vacuumDatabase(db: Database): void {
 // Document helpers
 // =============================================================================
 
-export async function hashContent(content: string): Promise<string> {
+export function hashContent(content: string): string {
   const hash = createHash("sha256");
   hash.update(content);
   return hash.digest("hex");
@@ -2077,141 +1827,6 @@ export function insertContent(db: Database, hash: string, content: string, creat
     .run(hash, content, createdAt);
 }
 
-/**
- * Insert a new document into the documents table.
- */
-export function insertDocument(
-  db: Database,
-  collectionName: string,
-  path: string,
-  title: string,
-  hash: string,
-  createdAt: string,
-  modifiedAt: string
-): void {
-  db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
-    ON CONFLICT(collection, path) DO UPDATE SET
-      title = excluded.title,
-      hash = excluded.hash,
-      modified_at = excluded.modified_at,
-      active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
-}
-
-/**
- * Find an active document by collection name and path.
- */
-export function findActiveDocument(
-  db: Database,
-  collectionName: string,
-  path: string
-): { id: number; hash: string; title: string } | null {
-  const row = db.prepare(`
-    SELECT id, hash, title FROM documents
-    WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
-  return row ?? null;
-}
-
-/**
- * Find an active document, falling back to a legacy lowercase path.
- * If found under the legacy path, renames it in-place and rebuilds the
- * FTS entry. Embeddings are keyed by content hash, so the rename is
- * safe — no re-embedding required.
- *
- * @internal Used by reindexCollection and indexFiles during qmd update.
- * Returns null if the document does not exist under either path.
- */
-export function findOrMigrateLegacyDocument(
-  db: Database,
-  collectionName: string,
-  path: string
-): { id: number; hash: string; title: string } | null {
-  const existing = findActiveDocument(db, collectionName, path);
-  if (existing) return existing;
-
-  const legacyPath = path.toLowerCase();
-  if (legacyPath === path) return null;
-
-  const legacy = findActiveDocument(db, collectionName, legacyPath);
-  if (!legacy) return null;
-
-  // Wrap rename + FTS rebuild in a transaction for atomicity.
-  const migrate = db.transaction(() => {
-    // Use OR IGNORE so a UNIQUE conflict (e.g. both "readme.md" and
-    // "README.md" already exist) is a no-op rather than crashing.
-    const result = db.prepare(
-      `UPDATE OR IGNORE documents SET path = ? WHERE id = ? AND active = 1`
-    ).run(path, legacy.id);
-
-    if (result.changes === 0) return false;
-
-    // FTS5 does not reliably update via the documents_au trigger's
-    // INSERT OR REPLACE. Manually rebuild the FTS entry.
-    db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(legacy.id);
-    db.prepare(`
-      INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT id, collection || '/' || path, title,
-             (SELECT doc FROM content WHERE hash = documents.hash)
-      FROM documents WHERE id = ?
-    `).run(legacy.id);
-
-    return true;
-  });
-
-  if (!migrate()) return null;
-
-  return findActiveDocument(db, collectionName, path);
-}
-
-/**
- * Update the title and modified_at timestamp for a document.
- */
-export function updateDocumentTitle(
-  db: Database,
-  documentId: number,
-  title: string,
-  modifiedAt: string
-): void {
-  db.prepare(`UPDATE documents SET title = ?, modified_at = ? WHERE id = ?`)
-    .run(title, modifiedAt, documentId);
-}
-
-/**
- * Update an existing document's hash, title, and modified_at timestamp.
- * Used when content changes but the file path stays the same.
- */
-export function updateDocument(
-  db: Database,
-  documentId: number,
-  title: string,
-  hash: string,
-  modifiedAt: string
-): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
-}
-
-/**
- * Deactivate a document (mark as inactive but don't delete).
- */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
-    .run(collectionName, path);
-}
-
-/**
- * Get all active document paths for a collection.
- */
-export function getActiveDocumentPaths(db: Database, collectionName: string): string[] {
-  const rows = db.prepare(`
-    SELECT path FROM documents WHERE collection = ? AND active = 1
-  `).all(collectionName) as { path: string }[];
-  return rows.map(r => r.path);
-}
-
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
 /**
@@ -2248,14 +1863,10 @@ export async function chunkDocumentAsync(
   const regexPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
 
-  let breakPoints = regexPoints;
-  if (chunkStrategy === "auto" && filepath) {
-    const { getASTBreakPoints } = await import("./ast.js");
-    const astPoints = await getASTBreakPoints(content, filepath);
-    if (astPoints.length > 0) {
-      breakPoints = mergeBreakPoints(regexPoints, astPoints);
-    }
-  }
+  // AST-aware chunking removed in planet-capture (code files aren't indexed).
+  const breakPoints = regexPoints;
+  void chunkStrategy;
+  void filepath;
 
   return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
 }
@@ -2414,458 +2025,6 @@ export function isDocid(input: string): boolean {
   return normalized.length >= 6 && /^[a-f0-9]+$/i.test(normalized);
 }
 
-/**
- * Find a document by its short docid (first 6 characters of hash).
- * Returns the document's virtual path if found, null otherwise.
- * If multiple documents match the same short hash (collision), returns the first one.
- *
- * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
- */
-export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
-  const shortHash = normalizeDocid(docid);
-
-  if (shortHash.length < 1) return null;
-
-  // Look up documents where hash starts with the short hash
-  const doc = db.prepare(`
-    SELECT 'qmd://' || d.collection || '/' || d.path as filepath, d.hash
-    FROM documents d
-    WHERE d.hash LIKE ? AND d.active = 1
-    LIMIT 1
-  `).get(`${shortHash}%`) as { filepath: string; hash: string } | null;
-
-  return doc;
-}
-
-export function findSimilarFiles(db: Database, query: string, maxDistance: number = 3, limit: number = 5): string[] {
-  const allFiles = db.prepare(`
-    SELECT d.path
-    FROM documents d
-    WHERE d.active = 1
-  `).all() as { path: string }[];
-  const queryLower = query.toLowerCase();
-  const scored = allFiles
-    .map(f => ({ path: f.path, dist: levenshtein(f.path.toLowerCase(), queryLower) }))
-    .filter(f => f.dist <= maxDistance)
-    .sort((a, b) => a.dist - b.dist)
-    .slice(0, limit);
-  return scored.map(f => f.path);
-}
-
-export function matchFilesByGlob(db: Database, pattern: string): { filepath: string; displayPath: string; bodyLength: number }[] {
-  const allFiles = db.prepare(`
-    SELECT
-      'qmd://' || d.collection || '/' || d.path as virtual_path,
-      LENGTH(content.doc) as body_length,
-      d.path,
-      d.collection
-    FROM documents d
-    JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
-  `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
-
-  const isMatch = picomatch(pattern);
-  return allFiles
-    .filter(f => isMatch(f.virtual_path) || isMatch(f.path) || isMatch(f.collection + '/' + f.path))
-    .map(f => ({
-      filepath: f.virtual_path,  // Virtual path for precise lookup
-      displayPath: f.path,        // Relative path for display
-      bodyLength: f.body_length
-    }));
-}
-
-// =============================================================================
-// Context
-// =============================================================================
-
-/**
- * Get context for a file path using hierarchical inheritance.
- * Contexts are collection-scoped and inherit from parent directories.
- * For example, context at "/talks" applies to "/talks/2024/keynote.md".
- *
- * @param db Database instance (unused - kept for compatibility)
- * @param collectionName Collection name
- * @param path Relative path within the collection
- * @returns Context string or null if no context is defined
- */
-export function getContextForPath(db: Database, collectionName: string, path: string): string | null {
-  const coll = getStoreCollection(db, collectionName);
-
-  if (!coll) return null;
-
-  // Collect ALL matching contexts (global + all path prefixes)
-  const contexts: string[] = [];
-
-  // Add global context if present
-  const globalCtx = getStoreGlobalContext(db);
-  if (globalCtx) {
-    contexts.push(globalCtx);
-  }
-
-  // Add all matching path contexts (from most general to most specific)
-  if (coll.context) {
-    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-
-    // Collect all matching prefixes
-    const matchingContexts: { prefix: string; context: string }[] = [];
-    for (const [prefix, context] of Object.entries(coll.context)) {
-      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
-      if (normalizedPath.startsWith(normalizedPrefix)) {
-        matchingContexts.push({ prefix: normalizedPrefix, context });
-      }
-    }
-
-    // Sort by prefix length (shortest/most general first)
-    matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
-
-    // Add all matching contexts
-    for (const match of matchingContexts) {
-      contexts.push(match.context);
-    }
-  }
-
-  // Join all contexts with double newline
-  return contexts.length > 0 ? contexts.join('\n\n') : null;
-}
-
-/**
- * Get context for a file path (virtual or filesystem).
- * Resolves the collection and relative path from the DB store_collections table.
- */
-export function getContextForFile(db: Database, filepath: string): string | null {
-  // Handle undefined or null filepath
-  if (!filepath) return null;
-
-  // Get all collections from DB
-  const collections = getStoreCollections(db);
-
-  // Parse virtual path format: qmd://collection/path
-  let collectionName: string | null = null;
-  let relativePath: string | null = null;
-
-  const parsedVirtual = filepath.startsWith('qmd://') ? parseVirtualPath(filepath) : null;
-  if (parsedVirtual) {
-    collectionName = parsedVirtual.collectionName;
-    relativePath = parsedVirtual.path;
-  } else {
-    // Filesystem path: find which collection this absolute path belongs to
-    for (const coll of collections) {
-      // Skip collections with missing paths
-      if (!coll || !coll.path) continue;
-
-      if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
-        collectionName = coll.name;
-        // Extract relative path
-        relativePath = filepath.startsWith(coll.path + '/')
-          ? filepath.slice(coll.path.length + 1)
-          : '';
-        break;
-      }
-    }
-
-    if (!collectionName || relativePath === null) return null;
-  }
-
-  // Get the collection from DB
-  const coll = getStoreCollection(db, collectionName);
-  if (!coll) return null;
-
-  // Verify this document exists in the database
-  const doc = db.prepare(`
-    SELECT d.path
-    FROM documents d
-    WHERE d.collection = ? AND d.path = ? AND d.active = 1
-    LIMIT 1
-  `).get(collectionName, relativePath) as { path: string } | null;
-
-  if (!doc) return null;
-
-  // Collect ALL matching contexts (global + all path prefixes)
-  const contexts: string[] = [];
-
-  // Add global context if present
-  const globalCtx = getStoreGlobalContext(db);
-  if (globalCtx) {
-    contexts.push(globalCtx);
-  }
-
-  // Add all matching path contexts (from most general to most specific)
-  if (coll.context) {
-    const normalizedPath = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
-
-    // Collect all matching prefixes
-    const matchingContexts: { prefix: string; context: string }[] = [];
-    for (const [prefix, context] of Object.entries(coll.context)) {
-      const normalizedPrefix = prefix.startsWith("/") ? prefix : `/${prefix}`;
-      if (normalizedPath.startsWith(normalizedPrefix)) {
-        matchingContexts.push({ prefix: normalizedPrefix, context });
-      }
-    }
-
-    // Sort by prefix length (shortest/most general first)
-    matchingContexts.sort((a, b) => a.prefix.length - b.prefix.length);
-
-    // Add all matching contexts
-    for (const match of matchingContexts) {
-      contexts.push(match.context);
-    }
-  }
-
-  // Join all contexts with double newline
-  return contexts.length > 0 ? contexts.join('\n\n') : null;
-}
-
-/**
- * Get collection by name from DB store_collections table.
- */
-export function getCollectionByName(db: Database, name: string): { name: string; pwd: string; glob_pattern: string } | null {
-  const collection = getStoreCollection(db, name);
-  if (!collection) return null;
-
-  return {
-    name: collection.name,
-    pwd: collection.path,
-    glob_pattern: collection.pattern,
-  };
-}
-
-/**
- * List all collections with document counts from database.
- * Merges store_collections config with database statistics.
- */
-export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[] {
-  const collections = getStoreCollections(db);
-
-  // Get document counts from database for each collection
-  const result = collections.map(coll => {
-    const stats = db.prepare(`
-      SELECT
-        COUNT(d.id) as doc_count,
-        SUM(CASE WHEN d.active = 1 THEN 1 ELSE 0 END) as active_count,
-        MAX(d.modified_at) as last_modified
-      FROM documents d
-      WHERE d.collection = ?
-    `).get(coll.name) as { doc_count: number; active_count: number; last_modified: string | null } | null;
-
-    return {
-      name: coll.name,
-      pwd: coll.path,
-      glob_pattern: coll.pattern,
-      doc_count: stats?.doc_count || 0,
-      active_count: stats?.active_count || 0,
-      last_modified: stats?.last_modified || null,
-      includeByDefault: coll.includeByDefault !== false,
-    };
-  });
-
-  return result;
-}
-
-/**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
- */
-export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
-
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
-
-  // Remove from store_collections
-  deleteStoreCollection(db, collectionName);
-
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
-}
-
-/**
- * Rename a collection.
- * Updates both YAML config and database documents table.
- */
-export function renameCollection(db: Database, oldName: string, newName: string): void {
-  // Update all documents with the new collection name in database
-  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
-    .run(newName, oldName);
-
-  // Rename in store_collections
-  renameStoreCollection(db, oldName, newName);
-}
-
-// =============================================================================
-// Context Management Operations
-// =============================================================================
-
-/**
- * Insert or update a context for a specific collection and path prefix.
- */
-export function insertContext(db: Database, collectionId: number, pathPrefix: string, context: string): void {
-  // Get collection name from ID
-  const coll = db.prepare(`SELECT name FROM collections WHERE id = ?`).get(collectionId) as { name: string } | null;
-  if (!coll) {
-    throw new Error(`Collection with id ${collectionId} not found`);
-  }
-
-  // Add context to store_collections
-  updateStoreContext(db, coll.name, pathPrefix, context);
-}
-
-/**
- * Delete a context for a specific collection and path prefix.
- * Returns the number of contexts deleted.
- */
-export function deleteContext(db: Database, collectionName: string, pathPrefix: string): number {
-  // Remove context from store_collections
-  const success = removeStoreContext(db, collectionName, pathPrefix);
-  return success ? 1 : 0;
-}
-
-/**
- * Delete all global contexts (contexts with empty path_prefix).
- * Returns the number of contexts deleted.
- */
-export function deleteGlobalContexts(db: Database): number {
-  let deletedCount = 0;
-
-  // Remove global context
-  setStoreGlobalContext(db, undefined);
-  deletedCount++;
-
-  // Remove root context (empty string) from all collections
-  const collections = getStoreCollections(db);
-  for (const coll of collections) {
-    const success = removeStoreContext(db, coll.name, '');
-    if (success) {
-      deletedCount++;
-    }
-  }
-
-  return deletedCount;
-}
-
-/**
- * List all contexts, grouped by collection.
- * Returns contexts ordered by collection name, then by path prefix length (longest first).
- */
-export function listPathContexts(db: Database): { collection_name: string; path_prefix: string; context: string }[] {
-  const allContexts = getStoreContexts(db);
-
-  // Convert to expected format and sort
-  return allContexts.map(ctx => ({
-    collection_name: ctx.collection,
-    path_prefix: ctx.path,
-    context: ctx.context,
-  })).sort((a, b) => {
-    // Sort by collection name first
-    if (a.collection_name !== b.collection_name) {
-      return a.collection_name.localeCompare(b.collection_name);
-    }
-    // Then by path prefix length (longest first)
-    if (a.path_prefix.length !== b.path_prefix.length) {
-      return b.path_prefix.length - a.path_prefix.length;
-    }
-    // Then alphabetically
-    return a.path_prefix.localeCompare(b.path_prefix);
-  });
-}
-
-/**
- * Get all collections (name only - from YAML config).
- */
-export function getAllCollections(db: Database): { name: string }[] {
-  const collections = getStoreCollections(db);
-  return collections.map(c => ({ name: c.name }));
-}
-
-/**
- * Check which collections don't have any context defined.
- * Returns collections that have no context entries at all (not even root context).
- */
-export function getCollectionsWithoutContext(db: Database): { name: string; pwd: string; doc_count: number }[] {
-  // Get all collections from DB
-  const allCollections = getStoreCollections(db);
-
-  // Filter to those without context
-  const collectionsWithoutContext: { name: string; pwd: string; doc_count: number }[] = [];
-
-  for (const coll of allCollections) {
-    // Check if collection has any context
-    if (!coll.context || Object.keys(coll.context).length === 0) {
-      // Get doc count from database
-      const stats = db.prepare(`
-        SELECT COUNT(d.id) as doc_count
-        FROM documents d
-        WHERE d.collection = ? AND d.active = 1
-      `).get(coll.name) as { doc_count: number } | null;
-
-      collectionsWithoutContext.push({
-        name: coll.name,
-        pwd: coll.path,
-        doc_count: stats?.doc_count || 0,
-      });
-    }
-  }
-
-  return collectionsWithoutContext.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/**
- * Get top-level directories in a collection that don't have context.
- * Useful for suggesting where context might be needed.
- */
-export function getTopLevelPathsWithoutContext(db: Database, collectionName: string): string[] {
-  // Get all paths in the collection from database
-  const paths = db.prepare(`
-    SELECT DISTINCT path FROM documents
-    WHERE collection = ? AND active = 1
-  `).all(collectionName) as { path: string }[];
-
-  // Get existing contexts for this collection from DB
-  const dbColl = getStoreCollection(db, collectionName);
-  if (!dbColl) return [];
-
-  const contextPrefixes = new Set<string>();
-  if (dbColl.context) {
-    for (const prefix of Object.keys(dbColl.context)) {
-      contextPrefixes.add(prefix);
-    }
-  }
-
-  // Extract top-level directories (first path component)
-  const topLevelDirs = new Set<string>();
-  for (const { path } of paths) {
-    const parts = path.split('/').filter(Boolean);
-    if (parts.length > 1) {
-      const dir = parts[0];
-      if (dir) topLevelDirs.add(dir);
-    }
-  }
-
-  // Filter out directories that already have context (exact or parent)
-  const missing: string[] = [];
-  for (const dir of topLevelDirs) {
-    let hasContext = false;
-
-    // Check if this dir or any parent has context
-    for (const prefix of contextPrefixes) {
-      if (prefix === '' || prefix === dir || dir.startsWith(prefix + '/')) {
-        hasContext = true;
-        break;
-      }
-    }
-
-    if (!hasContext) {
-      missing.push(dir);
-    }
-  }
-
-  return missing.sort();
-}
 
 // =============================================================================
 // FTS Search
@@ -3021,21 +2180,15 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, browser?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to force FTS5 to run first, then filter by collection.
-  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
-  // collection filter in a single WHERE clause, which can cause it to
-  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
   const params: (string | number)[] = [ftsQuery];
 
-  // When filtering by collection, fetch extra candidates from the FTS index
-  // since some will be filtered out. Without a collection filter we can
-  // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  // When filtering by browser, fetch extra candidates from the FTS index
+  // since some will be filtered out.
+  const ftsLimit = browser ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -3046,46 +2199,51 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       LIMIT ${ftsLimit}
     )
     SELECT
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
+      p.url,
+      p.title,
+      p.hash,
+      p.fetch_status,
+      p.fetched_at,
+      p.modified_at,
       content.doc as body,
-      d.hash,
-      fm.bm25_score
+      fm.bm25_score,
+      (SELECT GROUP_CONCAT(DISTINCT ps.browser) FROM page_sources ps WHERE ps.page_id = p.id) as browsers_csv,
+      (SELECT COALESCE(SUM(ps.visit_count), 0) FROM page_sources ps WHERE ps.page_id = p.id) as visit_count
     FROM fts_matches fm
-    JOIN documents d ON d.id = fm.rowid
-    JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
+    JOIN pages p ON p.id = fm.rowid
+    JOIN content ON content.hash = p.hash
+    WHERE p.active = 1
   `;
 
-  if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
+  if (browser) {
+    sql += ` AND EXISTS (SELECT 1 FROM page_sources ps WHERE ps.page_id = p.id AND ps.browser = ?)`;
+    params.push(String(browser));
   }
 
-  // bm25 lower is better; sort ascending.
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as {
+    url: string; title: string; hash: string;
+    fetch_status: string; fetched_at: string | null; modified_at: string;
+    body: string; bm25_score: number;
+    browsers_csv: string | null; visit_count: number;
+  }[];
   return rows.map(row => {
-    const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-    // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
-    // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
     // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
-    // Monotonic and query-independent — no per-query normalization needed.
     const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
     return {
-      filepath: row.filepath,
-      displayPath: row.display_path,
+      url: row.url,
       title: row.title,
       hash: row.hash,
       docid: getDocid(row.hash),
-      collectionName,
-      modifiedAt: "",  // Not available in FTS query
+      browsers: row.browsers_csv ? row.browsers_csv.split(",") : [],
+      visitCount: row.visit_count || 0,
+      fetchStatus: row.fetch_status,
+      fetchedAt: row.fetched_at,
+      modifiedAt: row.modified_at,
       bodyLength: row.body.length,
       body: row.body,
-      context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
     };
@@ -3096,7 +2254,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, browser?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -3104,9 +2262,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
-  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
-  // "optimize" this by combining into a single query with JOINs - it will break.
-  // See: https://github.com/tobi/qmd/pull/23
+  // hang indefinitely when combined with JOINs in the same query.
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   const vecResults = db.prepare(`
@@ -3117,45 +2273,52 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   if (vecResults.length === 0) return [];
 
-  // Step 2: Get chunk info and document data
+  // Step 2: Get chunk info and page data
   const hashSeqs = vecResults.map(r => r.hash_seq);
   const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
 
-  // Build query for document lookup
   const placeholders = hashSeqs.map(() => '?').join(',');
   let docSql = `
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
       cv.pos,
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body
+      p.id as page_id,
+      p.url,
+      p.title,
+      p.fetch_status,
+      p.fetched_at,
+      p.modified_at,
+      content.doc as body,
+      (SELECT GROUP_CONCAT(DISTINCT ps.browser) FROM page_sources ps WHERE ps.page_id = p.id) as browsers_csv,
+      (SELECT COALESCE(SUM(ps.visit_count), 0) FROM page_sources ps WHERE ps.page_id = p.id) as visit_count
     FROM content_vectors cv
-    JOIN documents d ON d.hash = cv.hash AND d.active = 1
-    JOIN content ON content.hash = d.hash
+    JOIN pages p ON p.hash = cv.hash AND p.active = 1
+    JOIN content ON content.hash = p.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+  if (browser) {
+    docSql += ` AND EXISTS (SELECT 1 FROM page_sources ps WHERE ps.page_id = p.id AND ps.browser = ?)`;
+    params.push(browser);
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    hash_seq: string; hash: string; pos: number;
+    page_id: number; url: string; title: string;
+    fetch_status: string; fetched_at: string | null; modified_at: string;
+    body: string;
+    browsers_csv: string | null; visit_count: number;
   }[];
 
-  // Combine with distances and dedupe by filepath
+  // Combine with distances and dedupe by url
   const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
   for (const row of docRows) {
     const distance = distanceMap.get(row.hash_seq) ?? 1;
-    const existing = seen.get(row.filepath);
+    const existing = seen.get(row.url);
     if (!existing || distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: distance });
+      seen.set(row.url, { row, bestDist: distance });
     }
   }
 
@@ -3163,19 +2326,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
     .map(({ row, bestDist }) => {
-      const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
-        filepath: row.filepath,
-        displayPath: row.display_path,
+        url: row.url,
         title: row.title,
         hash: row.hash,
         docid: getDocid(row.hash),
-        collectionName,
-        modifiedAt: "",  // Not available in vec query
+        browsers: row.browsers_csv ? row.browsers_csv.split(",") : [],
+        visitCount: row.visit_count || 0,
+        fetchStatus: row.fetch_status,
+        fetchedAt: row.fetched_at,
+        modifiedAt: row.modified_at,
         bodyLength: row.body.length,
         body: row.body,
-        context: getContextForFile(db, row.filepath),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - bestDist,
         source: "vec" as const,
         chunkPos: row.pos,
       };
@@ -3196,17 +2359,17 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
 }
 
 /**
- * Get all unique content hashes that need embeddings (from active documents).
- * Returns hash, document body, and a sample path for display purposes.
+ * Get all unique content hashes that need embeddings (from active fetched pages).
+ * Returns hash, page body, and the URL for display purposes.
  */
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
   return db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
-    FROM documents d
-    JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-    WHERE d.active = 1 AND v.hash IS NULL
-    GROUP BY d.hash
+    SELECT p.hash, c.doc as body, MIN(p.url) as path
+    FROM pages p
+    JOIN content c ON p.hash = c.hash
+    LEFT JOIN content_vectors v ON p.hash = v.hash AND v.seq = 0
+    WHERE p.active = 1 AND p.hash IS NOT NULL AND p.fetch_status = 'fetched' AND v.hash IS NULL
+    GROUP BY p.hash
   `).all() as { hash: string; body: string; path: string }[];
 }
 
@@ -3455,172 +2618,143 @@ export function buildRrfTrace(
 }
 
 // =============================================================================
-// Document retrieval
+// Page retrieval
 // =============================================================================
 
-type DbDocRow = {
-  virtual_path: string;
-  display_path: string;
+type DbPageRow = {
+  url: string;
   title: string;
-  hash: string;
-  collection: string;
-  path: string;
+  hash: string | null;
+  fetch_status: string;
+  fetched_at: string | null;
   modified_at: string;
   body_length: number;
   body?: string;
+  browsers_csv: string | null;
+  visit_count: number;
 };
 
 /**
- * Find a document by filename/path, docid (#hash), or with fuzzy matching.
- * Returns document metadata without body by default.
+ * Find similar URLs using Levenshtein distance against the URL field.
+ */
+export function findSimilarUrls(db: Database, query: string, maxDistance: number = 5, limit: number = 5): string[] {
+  const rows = db.prepare(`SELECT url FROM pages WHERE active = 1`).all() as { url: string }[];
+  const q = query.toLowerCase();
+  const scored = rows
+    .map(r => ({ url: r.url, dist: levenshtein(r.url.toLowerCase(), q) }))
+    .filter(r => r.dist <= maxDistance)
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, limit);
+  return scored.map(r => r.url);
+}
+
+/**
+ * Find a page by its short docid (first 6 characters of hash).
+ * Returns the matching URL + full hash, or null.
+ *
+ * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
+ */
+export function findPageByDocid(db: Database, docid: string): { url: string; hash: string } | null {
+  const shortHash = normalizeDocid(docid);
+  if (shortHash.length < 1) return null;
+
+  const row = db.prepare(`
+    SELECT p.url, p.hash
+    FROM pages p
+    WHERE p.hash LIKE ? AND p.active = 1 AND p.hash IS NOT NULL
+    LIMIT 1
+  `).get(`${shortHash}%`) as { url: string; hash: string } | null;
+
+  return row;
+}
+
+/**
+ * Find a page by URL or docid.
+ * Returns page metadata without body by default.
  *
  * Supports:
- * - Virtual paths: qmd://collection/path/to/file.md
- * - Absolute paths: /path/to/file.md
- * - Relative paths: path/to/file.md
+ * - Exact URL match
+ * - Suffix URL match (fuzzy)
  * - Short docid: #abc123 (first 6 chars of hash)
  */
-export function findDocument(db: Database, filename: string, options: { includeBody?: boolean } = {}): DocumentResult | DocumentNotFound {
-  let filepath = filename;
-  const colonMatch = filepath.match(/:(\d+)$/);
-  if (colonMatch) {
-    filepath = filepath.slice(0, -colonMatch[0].length);
-  }
+export function findPage(db: Database, urlOrDocid: string, options: { includeBody?: boolean } = {}): PageResult | PageNotFound {
+  let lookup = urlOrDocid.trim();
 
-  // Check if this is a docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
-  if (isDocid(filepath)) {
-    const docidMatch = findDocumentByDocid(db, filepath);
-    if (docidMatch) {
-      filepath = docidMatch.filepath;
+  // Docid lookup
+  if (isDocid(lookup)) {
+    const hit = findPageByDocid(db, lookup);
+    if (hit) {
+      lookup = hit.url;
     } else {
-      return { error: "not_found", query: filename, similarFiles: [] };
+      return { error: "not_found", query: urlOrDocid, similarUrls: [] };
     }
-  }
-
-  if (filepath.startsWith('~/')) {
-    filepath = homedir() + filepath.slice(1);
   }
 
   const bodyCol = options.includeBody ? `, content.doc as body` : ``;
-
-  // Build computed columns
-  // Note: absoluteFilepath is computed from YAML collections after query
   const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
-    d.title,
-    d.hash,
-    d.collection,
-    d.modified_at,
-    LENGTH(content.doc) as body_length
+    p.id as page_id,
+    p.url,
+    p.title,
+    p.hash,
+    p.fetch_status,
+    p.fetched_at,
+    p.modified_at,
+    COALESCE(LENGTH(content.doc), 0) as body_length,
+    (SELECT GROUP_CONCAT(DISTINCT ps.browser) FROM page_sources ps WHERE ps.page_id = p.id) as browsers_csv,
+    (SELECT COALESCE(SUM(ps.visit_count), 0) FROM page_sources ps WHERE ps.page_id = p.id) as visit_count
     ${bodyCol}
   `;
 
-  // Try to match by virtual path first
-  let doc = db.prepare(`
+  // Exact URL match
+  let row = db.prepare(`
     SELECT ${selectCols}
-    FROM documents d
-    JOIN content ON content.hash = d.hash
-    WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-  `).get(filepath) as DbDocRow | null;
+    FROM pages p
+    LEFT JOIN content ON content.hash = p.hash
+    WHERE p.url = ? AND p.active = 1
+  `).get(lookup) as (DbPageRow & { page_id: number }) | null;
 
-  // Try fuzzy match by virtual path
-  if (!doc) {
-    doc = db.prepare(`
+  // Suffix match
+  if (!row) {
+    row = db.prepare(`
       SELECT ${selectCols}
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
+      FROM pages p
+      LEFT JOIN content ON content.hash = p.hash
+      WHERE p.url LIKE ? AND p.active = 1
       LIMIT 1
-    `).get(`%${filepath}`) as DbDocRow | null;
+    `).get(`%${lookup}`) as (DbPageRow & { page_id: number }) | null;
   }
 
-  // Try to match by absolute path (requires looking up collection paths from DB)
-  if (!doc && !filepath.startsWith('qmd://')) {
-    const collections = getStoreCollections(db);
-    for (const coll of collections) {
-      let relativePath: string | null = null;
-
-      // If filepath is absolute and starts with collection path, extract relative part
-      if (filepath.startsWith(coll.path + '/')) {
-        relativePath = filepath.slice(coll.path.length + 1);
-      }
-      // Otherwise treat filepath as relative to collection
-      else if (!filepath.startsWith('/')) {
-        relativePath = filepath;
-      }
-
-      if (relativePath) {
-        doc = db.prepare(`
-          SELECT ${selectCols}
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as DbDocRow | null;
-        if (doc) break;
-      }
-    }
+  if (!row) {
+    const similar = findSimilarUrls(db, lookup, 5, 5);
+    return { error: "not_found", query: urlOrDocid, similarUrls: similar };
   }
-
-  if (!doc) {
-    const similar = findSimilarFiles(db, filepath, 5, 5);
-    return { error: "not_found", query: filename, similarFiles: similar };
-  }
-
-  // Get context using virtual path
-  const virtualPath = doc.virtual_path || `qmd://${doc.collection}/${doc.display_path}`;
-  const context = getContextForFile(db, virtualPath);
 
   return {
-    filepath: virtualPath,
-    displayPath: doc.display_path,
-    title: doc.title,
-    context,
-    hash: doc.hash,
-    docid: getDocid(doc.hash),
-    collectionName: doc.collection,
-    modifiedAt: doc.modified_at,
-    bodyLength: doc.body_length,
-    ...(options.includeBody && doc.body !== undefined && { body: doc.body }),
+    url: row.url,
+    title: row.title,
+    hash: row.hash || "",
+    docid: row.hash ? getDocid(row.hash) : "",
+    browsers: row.browsers_csv ? row.browsers_csv.split(",") : [],
+    visitCount: row.visit_count || 0,
+    fetchStatus: row.fetch_status,
+    fetchedAt: row.fetched_at,
+    modifiedAt: row.modified_at,
+    bodyLength: row.body_length,
+    ...(options.includeBody && row.body !== undefined && { body: row.body }),
   };
 }
 
 /**
- * Get the body content for a document
- * Optionally slice by line range
+ * Get the body content for a page.
+ * Optionally slice by line range.
  */
-export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: string }, fromLine?: number, maxLines?: number): string | null {
-  const filepath = doc.filepath;
-
-  // Try to resolve document by filepath (absolute or virtual)
-  let row: { body: string } | null = null;
-
-  // Try virtual path first
-  if (filepath.startsWith('qmd://')) {
-    row = db.prepare(`
-      SELECT content.doc as body
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-    `).get(filepath) as { body: string } | null;
-  }
-
-  // Try absolute path by looking up in DB store_collections
-  if (!row) {
-    const collections = getStoreCollections(db);
-    for (const coll of collections) {
-      if (filepath.startsWith(coll.path + '/')) {
-        const relativePath = filepath.slice(coll.path.length + 1);
-        row = db.prepare(`
-          SELECT content.doc as body
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE d.collection = ? AND d.path = ? AND d.active = 1
-        `).get(coll.name, relativePath) as { body: string } | null;
-        if (row) break;
-      }
-    }
-  }
+export function getPageBody(db: Database, page: PageResult | { url: string }, fromLine?: number, maxLines?: number): string | null {
+  const row = db.prepare(`
+    SELECT content.doc as body
+    FROM pages p
+    JOIN content ON content.hash = p.hash
+    WHERE p.url = ? AND p.active = 1
+  `).get(page.url) as { body: string } | null;
 
   if (!row) return null;
 
@@ -3631,167 +2765,66 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
     const end = maxLines !== undefined ? start + maxLines : lines.length;
     body = lines.slice(start, end).join('\n');
   }
-
   return body;
 }
 
-/**
- * Find multiple documents by glob pattern or comma-separated list
- * Returns documents without body by default (use getDocumentBody to load)
- */
-export function findDocuments(
-  db: Database,
-  pattern: string,
-  options: { includeBody?: boolean; maxBytes?: number } = {}
-): { docs: MultiGetResult[]; errors: string[] } {
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
-  const errors: string[] = [];
-  const maxBytes = options.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
-
-  const bodyCol = options.includeBody ? `, content.doc as body` : ``;
-  const selectCols = `
-    'qmd://' || d.collection || '/' || d.path as virtual_path,
-    d.collection || '/' || d.path as display_path,
-    d.title,
-    d.hash,
-    d.collection,
-    d.modified_at,
-    LENGTH(content.doc) as body_length
-    ${bodyCol}
-  `;
-
-  let fileRows: DbDocRow[];
-
-  if (isCommaSeparated) {
-    const names = pattern.split(',').map(s => s.trim()).filter(Boolean);
-    fileRows = [];
-    for (const name of names) {
-      let doc = db.prepare(`
-        SELECT ${selectCols}
-        FROM documents d
-        JOIN content ON content.hash = d.hash
-        WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1
-      `).get(name) as DbDocRow | null;
-      if (!doc) {
-        doc = db.prepare(`
-          SELECT ${selectCols}
-          FROM documents d
-          JOIN content ON content.hash = d.hash
-          WHERE 'qmd://' || d.collection || '/' || d.path LIKE ? AND d.active = 1
-          LIMIT 1
-        `).get(`%${name}`) as DbDocRow | null;
-      }
-      if (doc) {
-        fileRows.push(doc);
-      } else {
-        const similar = findSimilarFiles(db, name, 5, 3);
-        let msg = `File not found: ${name}`;
-        if (similar.length > 0) {
-          msg += ` (did you mean: ${similar.join(', ')}?)`;
-        }
-        errors.push(msg);
-      }
-    }
-  } else {
-    // Glob pattern match
-    const matched = matchFilesByGlob(db, pattern);
-    if (matched.length === 0) {
-      errors.push(`No files matched pattern: ${pattern}`);
-      return { docs: [], errors };
-    }
-    const virtualPaths = matched.map(m => m.filepath);
-    const placeholders = virtualPaths.map(() => '?').join(',');
-    fileRows = db.prepare(`
-      SELECT ${selectCols}
-      FROM documents d
-      JOIN content ON content.hash = d.hash
-      WHERE 'qmd://' || d.collection || '/' || d.path IN (${placeholders}) AND d.active = 1
-    `).all(...virtualPaths) as DbDocRow[];
-  }
-
-  const results: MultiGetResult[] = [];
-
-  for (const row of fileRows) {
-    // Get context using virtual path
-    const virtualPath = row.virtual_path || `qmd://${row.collection}/${row.display_path}`;
-    const context = getContextForFile(db, virtualPath);
-
-    if (row.body_length > maxBytes) {
-      results.push({
-        doc: { filepath: virtualPath, displayPath: row.display_path },
-        skipped: true,
-        skipReason: `File too large (${Math.round(row.body_length / 1024)}KB > ${Math.round(maxBytes / 1024)}KB)`,
-      });
-      continue;
-    }
-
-    results.push({
-      doc: {
-        filepath: virtualPath,
-        displayPath: row.display_path,
-        title: row.title || row.display_path.split('/').pop() || row.display_path,
-        context,
-        hash: row.hash,
-        docid: getDocid(row.hash),
-        collectionName: row.collection,
-        modifiedAt: row.modified_at,
-        bodyLength: row.body_length,
-        ...(options.includeBody && row.body !== undefined && { body: row.body }),
-      },
-      skipped: false,
-    });
-  }
-
-  return { docs: results, errors };
-}
 
 // =============================================================================
 // Status
 // =============================================================================
 
 export function getStatus(db: Database): IndexStatus {
-  // DB is source of truth for collections — config provides supplementary metadata
-  const dbCollections = db.prepare(`
+  const pageCounts = db.prepare(`
     SELECT
-      collection as name,
-      COUNT(*) as active_count,
-      MAX(modified_at) as last_doc_update
-    FROM documents
+      COUNT(*) as total,
+      SUM(CASE WHEN fetch_status = 'fetched' THEN 1 ELSE 0 END) as fetched,
+      SUM(CASE WHEN fetch_status = 'pending' THEN 1 ELSE 0 END) as pending,
+      SUM(CASE WHEN fetch_status = 'failed' THEN 1 ELSE 0 END) as failed
+    FROM pages
     WHERE active = 1
-    GROUP BY collection
-  `).all() as { name: string; active_count: number; last_doc_update: string | null }[];
+  `).get() as { total: number; fetched: number; pending: number; failed: number };
 
-  // Build a lookup from store_collections for path/pattern metadata
-  const storeCollections = getStoreCollections(db);
-  const configLookup = new Map(storeCollections.map(c => [c.name, { path: c.path, pattern: c.pattern }]));
+  // Per-browser counts: distinct pages reachable from each browser via page_sources
+  const browserRows = db.prepare(`
+    SELECT
+      b.name,
+      b.history_path,
+      b.bookmarks_path,
+      b.detected_at,
+      b.last_synced_at,
+      (SELECT COUNT(DISTINCT ps.page_id)
+         FROM page_sources ps
+         JOIN pages p ON p.id = ps.page_id
+         WHERE ps.browser = b.name AND p.active = 1) as pages
+    FROM browsers b
+    ORDER BY b.name
+  `).all() as {
+    name: string; history_path: string | null; bookmarks_path: string | null;
+    detected_at: string; last_synced_at: string | null; pages: number;
+  }[];
 
-  const collections: CollectionInfo[] = dbCollections.map(row => {
-    const config = configLookup.get(row.name);
-    return {
-      name: row.name,
-      path: config?.path ?? null,
-      pattern: config?.pattern ?? null,
-      documents: row.active_count,
-      lastUpdated: row.last_doc_update || new Date().toISOString(),
-    };
-  });
+  const browsers: BrowserInfo[] = browserRows.map(b => ({
+    name: b.name,
+    historyPath: b.history_path,
+    bookmarksPath: b.bookmarks_path,
+    detectedAt: b.detected_at,
+    lastSyncedAt: b.last_synced_at,
+    pages: b.pages || 0,
+  }));
 
-  // Sort by last update time (most recent first)
-  collections.sort((a, b) => {
-    if (!a.lastUpdated) return 1;
-    if (!b.lastUpdated) return -1;
-    return new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime();
-  });
-
-  const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
   const needsEmbedding = getHashesNeedingEmbedding(db);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  const lastRun = getLastIndexerRun(db);
 
   return {
-    totalDocuments: totalDocs,
+    totalPages: pageCounts?.total || 0,
+    fetchedPages: pageCounts?.fetched || 0,
+    pendingPages: pageCounts?.pending || 0,
+    failedPages: pageCounts?.failed || 0,
     needsEmbedding,
     hasVectorIndex: hasVectors,
-    collections,
+    browsers,
+    lastRun,
   };
 }
 
@@ -4046,9 +3079,9 @@ export async function hybridQuery(
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
-    for (const r of initialFts) docidMap.set(r.filepath, r.docid);
+    for (const r of initialFts) docidMap.set(r.url, r.docid);
     rankedLists.push(initialFts.map(r => ({
-      file: r.filepath, displayPath: r.displayPath,
+      file: r.url, displayPath: r.url,
       title: r.title, body: r.body || "", score: r.score,
     })));
     rankedListMeta.push({ source: "fts", queryType: "original", query });
@@ -4065,9 +3098,9 @@ export async function hybridQuery(
     if (q.type === 'lex') {
       const ftsResults = store.searchFTS(q.query, 20, collection);
       if (ftsResults.length > 0) {
-        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+        for (const r of ftsResults) docidMap.set(r.url, r.docid);
         rankedLists.push(ftsResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
+          file: r.url, displayPath: r.url,
           title: r.title, body: r.body || "", score: r.score,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
@@ -4104,9 +3137,9 @@ export async function hybridQuery(
         undefined, embedding
       );
       if (vecResults.length > 0) {
-        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+        for (const r of vecResults) docidMap.set(r.url, r.docid);
         rankedLists.push(vecResults.map(r => ({
-          file: r.filepath, displayPath: r.displayPath,
+          file: r.url, displayPath: r.url,
           title: r.title, body: r.body || "", score: r.score,
         })));
         rankedListMeta.push({
@@ -4335,15 +3368,15 @@ export async function vectorSearchQuery(
   for (const q of queryTexts) {
     const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
     for (const r of vecResults) {
-      const existing = allResults.get(r.filepath);
+      const existing = allResults.get(r.url);
       if (!existing || r.score > existing.score) {
-        allResults.set(r.filepath, {
-          file: r.filepath,
-          displayPath: r.displayPath,
+        allResults.set(r.url, {
+          file: r.url,
+          displayPath: r.url,
           title: r.title,
           body: r.body || "",
           score: r.score,
-          context: store.getContextForFile(r.filepath),
+          context: store.getContextForFile(r.url),
           docid: r.docid,
         });
       }
@@ -4448,9 +3481,9 @@ export async function structuredSearch(
       for (const coll of collectionList) {
         const ftsResults = store.searchFTS(search.query, 20, coll);
         if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+          for (const r of ftsResults) docidMap.set(r.url, r.docid);
           rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
+            file: r.url, displayPath: r.url,
             title: r.title, body: r.body || "", score: r.score,
           })));
           rankedListMeta.push({
@@ -4487,9 +3520,9 @@ export async function structuredSearch(
             undefined, embedding
           );
           if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            for (const r of vecResults) docidMap.set(r.url, r.docid);
             rankedLists.push(vecResults.map(r => ({
-              file: r.filepath, displayPath: r.displayPath,
+              file: r.url, displayPath: r.url,
               title: r.title, body: r.body || "", score: r.score,
             })));
             rankedListMeta.push({

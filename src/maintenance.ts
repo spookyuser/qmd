@@ -11,7 +11,7 @@ import {
   cleanupOrphanedContent,
   cleanupOrphanedVectors,
   deleteLLMCache,
-  deleteInactiveDocuments,
+  deleteInactivePages,
   clearAllEmbeddings,
 } from "./store.js";
 
@@ -42,9 +42,9 @@ export class Maintenance {
     return deleteLLMCache(this.store.db);
   }
 
-  /** Delete documents marked as inactive (removed from filesystem) */
-  deleteInactiveDocs(): number {
-    return deleteInactiveDocuments(this.store.db);
+  /** Delete pages marked as inactive */
+  deleteInactivePages(): number {
+    return deleteInactivePages(this.store.db);
   }
 
   /** Clear all vector embeddings (forces re-embedding) */
