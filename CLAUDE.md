@@ -1,125 +1,67 @@
-# QMD - Query Markup Documents
+# planet-capture
+
+Index and search your browser history with hybrid BM25 + vector search + LLM reranking.
 
 Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 
 ## Commands
 
 ```sh
-qmd collection add . --name <n>   # Create/index collection
-qmd collection list               # List all collections with details
-qmd collection remove <name>      # Remove a collection by name
-qmd collection rename <old> <new> # Rename a collection
-qmd ls [collection[/path]]        # List collections or files in a collection
-qmd context add [path] "text"     # Add context for path (defaults to current dir)
-qmd context list                  # List all contexts
-qmd context check                 # Check for collections/paths missing context
-qmd context rm <path>             # Remove context
-qmd get <file>                    # Get document by path or docid (#abc123)
-qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
-qmd status                        # Show index status and collections
-qmd update [--pull]               # Re-index all collections (--pull: git pull first)
-qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
-qmd query <query>                 # Search with query expansion + reranking (recommended)
-qmd search <query>                # Full-text keyword search (BM25, no LLM)
-qmd vsearch <query>               # Vector similarity search (no reranking)
-qmd mcp                           # Start MCP server (stdio transport)
-qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
-qmd mcp --http --daemon           # Start as background daemon
-qmd mcp stop                      # Stop background MCP daemon
-```
-
-## Collection Management
-
-```sh
-# List all collections
-qmd collection list
-
-# Create a collection with explicit name
-qmd collection add ~/Documents/notes --name mynotes --mask '**/*.md'
-
-# Remove a collection
-qmd collection remove mynotes
-
-# Rename a collection
-qmd collection rename mynotes my-notes
-
-# List all files in a collection
-qmd ls mynotes
-
-# List files with a path prefix
-qmd ls journals/2025
-qmd ls qmd://journals/2025
-```
-
-## Context Management
-
-```sh
-# Add context to current directory (auto-detects collection)
-qmd context add "Description of these files"
-
-# Add context to a specific path
-qmd context add /subfolder "Description for subfolder"
-
-# Add global context to all collections (system message)
-qmd context add / "Always include this context"
-
-# Add context using virtual paths
-qmd context add qmd://journals/ "Context for entire journals collection"
-qmd context add qmd://journals/2024 "Journal entries from 2024"
-
-# List all contexts
-qmd context list
-
-# Check for collections or paths without context
-qmd context check
-
-# Remove context
-qmd context rm qmd://journals/2024
-qmd context rm /  # Remove global context
+planet-capture index              # Discover URLs from browsers + fetch pages
+planet-capture discover           # Only read browser history (no fetch)
+planet-capture fetch              # Only fetch pending pages (no discover)
+planet-capture search <query>     # BM25 full-text search
+planet-capture vsearch <query>    # Vector similarity search
+planet-capture query <query>      # Hybrid search (BM25 + vector + rerank)
+planet-capture get <url|#docid>   # Show a single page
+planet-capture status             # Show index counts and browsers
+planet-capture browsers           # List detected browsers
+planet-capture filters list       # List URL exclusion filters
+planet-capture filters add <pat>  # Add URL filter pattern
+planet-capture filters remove <p> # Remove URL filter
+planet-capture embed              # Generate vector embeddings
+planet-capture mcp                # Start MCP server (stdio)
+planet-capture mcp --http         # Start MCP server (HTTP, default port 8181)
+planet-capture mcp --http --port=N  # HTTP on custom port
 ```
 
 ## Document IDs (docid)
 
-Each document has a unique short ID (docid) - the first 6 characters of its content hash.
-Docids are shown in search results as `#abc123` and can be used with `get` and `multi-get`:
+Each page has a unique short ID (docid) — the first 6 characters of its content hash.
+Docids are shown in search results as `#abc123` and can be used with `get`:
 
 ```sh
-# Search returns docid in results
-qmd search "query" --json
-# Output: [{"docid": "#abc123", "score": 0.85, "file": "docs/readme.md", ...}]
-
-# Get document by docid
-qmd get "#abc123"
-qmd get abc123              # Leading # is optional
-
-# Docids also work in multi-get comma-separated lists
-qmd multi-get "#abc123, #def456"
+planet-capture get "#abc123"
+planet-capture get abc123    # Leading # is optional
 ```
 
 ## Options
 
 ```sh
 # Search & retrieval
--c, --collection <name>  # Restrict search to a collection (matches pwd suffix)
--n <num>                 # Number of results
---all                    # Return all matches
---min-score <num>        # Minimum score threshold
---full                   # Show full document content
---line-numbers           # Add line numbers to output
+--browser=NAME       # Restrict search to a specific browser
+-n <num>             # Number of results
+--min-score <num>    # Minimum score threshold
+--full               # Show full page content
+--line-numbers       # Add line numbers to output
+--intent=TEXT        # Disambiguation intent (query only)
 
-# Multi-get specific
--l <num>                 # Maximum lines per file
---max-bytes <num>        # Skip files larger than this (default 10KB)
+# Index options
+--since=DATE         # Only include history after this date
+--rate-limit=N       # Fetches per second (default 2)
+--max-pages=N        # Max pages to fetch this run
+--discover-only      # Skip fetching
+--dry-run            # Show what would happen
 
-# Output formats (search and multi-get)
+# Output formats
 --json, --csv, --md, --xml, --files
 ```
 
 ## Development
 
 ```sh
-bun src/cli/qmd.ts <command>   # Run from source
-bun link               # Install globally as 'qmd'
+bun src/cli/planet-capture.ts <command>   # Run from source
+bun link                                  # Install globally
 ```
 
 ## Tests
@@ -128,7 +70,6 @@ All tests live in `test/`. Run everything:
 
 ```sh
 npx vitest run --reporter=verbose test/
-bun test --preload ./src/test-preload.ts test/
 ```
 
 ## Architecture
@@ -138,29 +79,19 @@ bun test --preload ./src/test-preload.ts test/
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
-- AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs) at function/class/import boundaries via tree-sitter. Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking.
+- Supports Chrome, Arc, Brave, and Safari on macOS
+- Pages table with content-addressable storage (hash → content)
+- page_sources tracks which browsers contributed each URL
 
 ## Important: Do NOT run automatically
 
-- Never run `qmd collection add`, `qmd embed`, or `qmd update` automatically
+- Never run `planet-capture index`, `planet-capture embed`, or `planet-capture discover` automatically
 - Never modify the SQLite database directly
 - Write out example commands for the user to run manually
-- Index is stored at `~/.cache/qmd/index.sqlite`
+- Index is stored at `~/.planet-capture/index.db`
 
 ## Do NOT compile
 
-- Never run `bun build --compile` - it overwrites the shell wrapper and breaks sqlite-vec
-- The `qmd` file is a shell script that runs compiled JS from `dist/` - do not replace it
+- Never run `bun build --compile` — it overwrites the shell wrapper and breaks sqlite-vec
+- The `planet-capture` bin file is a shell script that runs compiled JS from `dist/`
 - `npm run build` compiles TypeScript to `dist/` via `tsc -p tsconfig.build.json`
-
-## Releasing
-
-Use `/release <version>` to cut a release. Full changelog standards,
-release workflow, and git hook setup are documented in the
-[release skill](skills/release/SKILL.md).
-
-Key points:
-- Add changelog entries under `## [Unreleased]` **as you make changes**
-- The release script renames `[Unreleased]` → `[X.Y.Z] - date` at release time
-- Credit external PRs with `#NNN (thanks @username)`
-- GitHub releases roll up the full minor series (e.g. 1.2.0 through 1.2.3)
