@@ -1,7 +1,7 @@
 {
-  "name": "@tobilu/qmd",
-  "version": "2.1.0",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "name": "planet-capture",
+  "version": "0.1.0",
+  "description": "Index and search your browser history with hybrid BM25 + vector search + LLM reranking",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "qmd": "bin/qmd"
+    "planet-capture": "bin/planet-capture"
   },
   "files": [
     "bin/",
@@ -21,38 +21,25 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
-    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js",
+    "build": "tsc -p tsconfig.build.json && printf '#!/usr/bin/env node\n' | cat - dist/cli/planet-capture.js > dist/cli/planet-capture.tmp && mv dist/cli/planet-capture.tmp dist/cli/planet-capture.js && chmod +x dist/cli/planet-capture.js",
     "test": "vitest run --reporter=verbose test/",
-    "qmd": "tsx src/cli/qmd.ts",
-    "index": "tsx src/cli/qmd.ts index",
-    "vector": "tsx src/cli/qmd.ts vector",
-    "search": "tsx src/cli/qmd.ts search",
-    "vsearch": "tsx src/cli/qmd.ts vsearch",
-    "rerank": "tsx src/cli/qmd.ts rerank",
-    "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",
-    "release": "./scripts/release.sh"
-  },
-  "publishConfig": {
-    "access": "public"
+    "dev": "bun src/cli/planet-capture.ts"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
+    "url": "git+https://github.com/spookyuser/planet-capture.git"
   },
-  "homepage": "https://github.com/tobi/qmd#readme",
+  "homepage": "https://github.com/spookyuser/planet-capture#readme",
   "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "url": "https://github.com/spookyuser/planet-capture/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@mozilla/readability": "^0.6.0",
     "better-sqlite3": "12.8.0",
-    "fast-glob": "3.3.3",
+    "linkedom": "^0.18.9",
     "node-llama-cpp": "3.18.1",
-    "picomatch": "4.0.4",
     "sqlite-vec": "0.1.9",
-    "web-tree-sitter": "0.26.7",
-    "yaml": "2.8.3",
     "zod": "4.2.1"
   },
   "optionalDependencies": {
@@ -60,11 +47,7 @@
     "sqlite-vec-darwin-x64": "0.1.9",
     "sqlite-vec-linux-arm64": "0.1.9",
     "sqlite-vec-linux-x64": "0.1.9",
-    "sqlite-vec-windows-x64": "0.1.9",
-    "tree-sitter-go": "0.23.4",
-    "tree-sitter-python": "0.23.4",
-    "tree-sitter-rust": "0.24.0",
-    "tree-sitter-typescript": "0.23.2"
+    "sqlite-vec-windows-x64": "0.1.9"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
@@ -75,12 +58,7 @@
     "onlyBuiltDependencies": [
       "better-sqlite3",
       "esbuild",
-      "node-llama-cpp",
-      "tree-sitter-go",
-      "tree-sitter-javascript",
-      "tree-sitter-python",
-      "tree-sitter-rust",
-      "tree-sitter-typescript"
+      "node-llama-cpp"
     ]
   },
   "peerDependencies": {
@@ -90,7 +68,7 @@
     "node": ">=22.0.0"
   },
   "keywords": [
-    "markdown",
+    "browser-history",
     "search",
     "fts",
     "full-text-search",
@@ -102,10 +80,10 @@
     "rag",
     "mcp",
     "reranking",
-    "knowledge-base",
+    "bookmarks",
     "local-ai",
-    "llm"
+    "llm",
+    "readability"
   ],
-  "author": "Tobi Lutke <tobi@lutke.com>",
   "license": "MIT"
 }

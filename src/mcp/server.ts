@@ -1,836 +1,298 @@
-/**
- * QMD MCP Server - Model Context Protocol server for QMD
- *
- * Exposes QMD search and document retrieval as MCP tools and resources.
- * Documents are accessible via qmd:// URIs.
- *
- * Follows MCP spec 2025-06-18 for proper response types.
- */
-
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "url";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { WebStandardStreamableHTTPServerTransport }
-  from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { existsSync } from "fs";
+import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import {
   createStore,
+  enableProductionMode,
+  hybridQuery,
   extractSnippet,
   addLineNumbers,
-  getDefaultDbPath,
   DEFAULT_MULTI_GET_MAX_BYTES,
-  type QMDStore,
-  type ExpandedQuery,
-  type IndexStatus,
-} from "../index.js";
-import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+  type Store,
+} from "../store.js";
+import { LlamaCpp } from "../llm.js";
 
 enableProductionMode();
 
-// =============================================================================
-// Types for structured content
-// =============================================================================
-
-type SearchResultItem = {
-  docid: string;  // Short docid (#abc123) for quick reference
-  file: string;
-  title: string;
-  score: number;
-  context: string | null;
-  snippet: string;
-};
-
-type StatusResult = {
-  totalDocuments: number;
-  needsEmbedding: number;
-  hasVectorIndex: boolean;
-  collections: {
-    name: string;
-    path: string | null;
-    pattern: string | null;
-    documents: number;
-    lastUpdated: string;
-  }[];
-};
-
-// =============================================================================
-// Helper functions
-// =============================================================================
-
-/**
- * Encode a path for use in qmd:// URIs.
- * Encodes special characters but preserves forward slashes for readability.
- */
-function encodeQmdPath(path: string): string {
-  // Encode each path segment separately to preserve slashes
-  return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
-}
-
-/**
- * Format search results as human-readable text summary
- */
-function formatSearchSummary(results: SearchResultItem[], query: string): string {
-  if (results.length === 0) {
-    return `No results found for "${query}"`;
-  }
-  const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
-  for (const r of results) {
-    lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
-  }
-  return lines.join('\n');
-}
-
-function getPackageVersion(): string {
-  try {
-    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-    return pkg.version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-// =============================================================================
-// MCP Server
-// =============================================================================
-
-/**
- * Build dynamic server instructions from actual index state.
- * Injected into the LLM's system prompt via MCP initialize response —
- * gives the LLM immediate context about what's searchable without a tool call.
- */
-async function buildInstructions(store: QMDStore): Promise<string> {
-  const status = await store.getStatus();
-  const contexts = await store.listContexts();
-  const globalCtx = await store.getGlobalContext();
-  const lines: string[] = [];
-
-  // --- What is this? ---
-  lines.push(`QMD is your local search engine over ${status.totalDocuments} markdown documents.`);
-  if (globalCtx) lines.push(`Context: ${globalCtx}`);
-
-  // --- What's searchable? ---
-  if (status.collections.length > 0) {
-    lines.push("");
-    lines.push("Collections (scope with `collection` parameter):");
-    for (const col of status.collections) {
-      // Find root context for this collection
-      const rootCtx = contexts.find(c => c.collection === col.name && (c.path === "" || c.path === "/"));
-      const desc = rootCtx ? ` — ${rootCtx.context}` : "";
-      lines.push(`  - "${col.name}" (${col.documents} docs)${desc}`);
-    }
-  }
-
-  // --- Capability gaps ---
-  if (!status.hasVectorIndex) {
-    lines.push("");
-    lines.push("Note: No vector embeddings yet. Run `qmd embed` to enable semantic search (vec/hyde).");
-  } else if (status.needsEmbedding > 0) {
-    lines.push("");
-    lines.push(`Note: ${status.needsEmbedding} documents need embedding. Run \`qmd embed\` to update.`);
-  }
-
-  // --- Search tool ---
-  lines.push("");
-  lines.push("Search: Use `query` with sub-queries (lex/vec/hyde):");
-  lines.push("  - type:'lex' — BM25 keyword search (exact terms, fast)");
-  lines.push("  - type:'vec' — semantic vector search (meaning-based)");
-  lines.push("  - type:'hyde' — hypothetical document (write what the answer looks like)");
-  lines.push("");
-  lines.push("  Always provide `intent` on every search call to disambiguate and improve snippets.");
-  lines.push("");
-  lines.push("Examples:");
-  lines.push("  Quick keyword lookup: [{type:'lex', query:'error handling'}]");
-  lines.push("  Semantic search: [{type:'vec', query:'how to handle errors gracefully'}]");
-  lines.push("  Best results: [{type:'lex', query:'error'}, {type:'vec', query:'error handling best practices'}]");
-  lines.push("  With intent: searches=[{type:'lex', query:'performance'}], intent='web page load times'");
-
-  // --- Retrieval workflow ---
-  lines.push("");
-  lines.push("Retrieval:");
-  lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
-  lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
-
-  // --- Non-obvious things that prevent mistakes ---
-  lines.push("");
-  lines.push("Tips:");
-  lines.push("  - File paths in results are relative to their collection.");
-  lines.push("  - Use `minScore: 0.5` to filter low-confidence results.");
-  lines.push("  - Results include a `context` field describing the content type.");
-
-  return lines.join("\n");
-}
-
-/**
- * Create an MCP server with all QMD tools, resources, and prompts registered.
- * Shared by both stdio and HTTP transports.
- */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+function createMcpServer(store: Store): McpServer {
   const server = new McpServer(
-    { name: "qmd", version: getPackageVersion() },
-    { instructions: await buildInstructions(store) },
-  );
-
-  // Pre-fetch default collection names for search tools
-  const defaultCollectionNames = await store.getDefaultCollectionNames();
-
-  // ---------------------------------------------------------------------------
-  // Resource: qmd://{path} - read-only access to documents by path
-  // Note: No list() - documents are discovered via search tools
-  // ---------------------------------------------------------------------------
-
-  server.registerResource(
-    "document",
-    new ResourceTemplate("qmd://{+path}", { list: undefined }),
-    {
-      title: "QMD Document",
-      description: "A markdown document from your QMD knowledge base. Use search tools to discover documents.",
-      mimeType: "text/markdown",
-    },
-    async (uri, { path }) => {
-      // Decode URL-encoded path (MCP clients send encoded URIs)
-      const pathStr = Array.isArray(path) ? path.join('/') : (path || '');
-      const decodedPath = decodeURIComponent(pathStr);
-
-      // Use SDK to find document — findDocument handles collection/path resolution
-      const result = await store.get(decodedPath, { includeBody: true });
-
-      if ("error" in result) {
-        return { contents: [{ uri: uri.href, text: `Document not found: ${decodedPath}` }] };
-      }
-
-      let text = addLineNumbers(result.body || "");  // Default to line numbers
-      if (result.context) {
-        text = `<!-- Context: ${result.context} -->\n\n` + text;
-      }
-
-      return {
-        contents: [{
-          uri: uri.href,
-          name: result.displayPath,
-          title: result.title || result.displayPath,
-          mimeType: "text/markdown",
-          text,
-        }],
-      };
-    }
+    { name: "planet-capture", version: "0.1.0" },
+    { capabilities: { tools: {} } },
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: query (Primary search tool)
+  // Tool: search
   // ---------------------------------------------------------------------------
-
-  const subSearchSchema = z.object({
-    type: z.enum(['lex', 'vec', 'hyde']).describe(
-      "lex = BM25 keywords (supports \"phrase\" and -negation); " +
-      "vec = semantic question; hyde = hypothetical answer passage"
-    ),
-    query: z.string().describe(
-      "The query text. For lex: use keywords, \"quoted phrases\", and -negation. " +
-      "For vec: natural language question. For hyde: 50-100 word answer passage."
-    ),
-  });
-
-  server.registerTool(
-    "query",
+  server.tool(
+    "search",
+    "Search your browser history using hybrid BM25 + vector + LLM reranking. Returns the most relevant pages matching the query.",
     {
-      title: "Query",
-      description: `Search the knowledge base using a query document — one or more typed sub-queries combined for best recall.
-
-## Query Types
-
-**lex** — BM25 keyword search. Fast, exact, no LLM needed.
-Full lex syntax:
-- \`term\` — prefix match ("perf" matches "performance")
-- \`"exact phrase"\` — phrase must appear verbatim
-- \`-term\` or \`-"phrase"\` — exclude documents containing this
-
-Good lex examples:
-- \`"connection pool" timeout -redis\`
-- \`"machine learning" -sports -athlete\`
-- \`handleError async typescript\`
-
-**vec** — Semantic vector search. Write a natural language question. Finds documents by meaning, not exact words.
-- \`how does the rate limiter handle burst traffic?\`
-- \`what is the tradeoff between consistency and availability?\`
-
-**hyde** — Hypothetical document. Write 50-100 words that look like the answer. Often the most powerful for nuanced topics.
-- \`The rate limiter uses a token bucket algorithm. When a client exceeds 100 req/min, subsequent requests return 429 until the window resets.\`
-
-## Strategy
-
-Combine types for best results. First sub-query gets 2× weight — put your strongest signal first.
-
-| Goal | Approach |
-|------|----------|
-| Know exact term/name | \`lex\` only |
-| Concept search | \`vec\` only |
-| Best recall | \`lex\` + \`vec\` |
-| Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
-
-## Examples
-
-Simple lookup:
-\`\`\`json
-[{ "type": "lex", "query": "CAP theorem" }]
-\`\`\`
-
-Best recall on a technical topic:
-\`\`\`json
-[
-  { "type": "lex", "query": "\\"connection pool\\" timeout -redis" },
-  { "type": "vec", "query": "why do database connections time out under load" },
-  { "type": "hyde", "query": "Connection pool exhaustion occurs when all connections are in use and new requests must wait. This typically happens under high concurrency when queries run longer than expected." }
-]
-\`\`\`
-
-Intent-aware lex (C++ performance, not sports):
-\`\`\`json
-[
-  { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
-  { "type": "vec", "query": "how to optimize C++ program performance" }
-]
-\`\`\``,
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
-        ),
-        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
-        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
-        candidateLimit: z.number().optional().describe(
-          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
-        ),
-        collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
-        intent: z.string().optional().describe(
-          "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
-        ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
-        ),
-      },
+      query: z.string().describe("Search query"),
+      limit: z.number().int().min(1).max(50).optional().describe("Max results (default 10)"),
+      browser: z.string().optional().describe("Restrict to a specific browser"),
+      rerank: z.boolean().optional().describe("Use LLM reranking (default true)"),
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Map to internal format
-      const queries: ExpandedQuery[] = searches.map(s => ({
-        type: s.type,
-        query: s.query,
-      }));
-
-      // Use default collections if none specified
-      const effectiveCollections = collections ?? defaultCollectionNames;
-
-      const results = await store.search({
-        queries,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        limit,
-        minScore,
-        rerank,
-        intent,
+    async ({ query, limit, browser, rerank }) => {
+      const results = await hybridQuery(store, query, {
+        collection: browser,
+        limit: limit ?? 10,
+        skipRerank: rerank === false,
       });
 
-      // Use first lex or vec query for snippet extraction
-      const primaryQuery = searches.find(s => s.type === 'lex')?.query
-        || searches.find(s => s.type === 'vec')?.query
-        || searches[0]?.query || "";
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: `No results found for "${query}".` }] };
+      }
 
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
+      const text = results
+        .map((r, i) => {
+          const snippet = extractSnippet(r.body, query, 300, r.bestChunkPos);
+          return [
+            `${i + 1}. ${r.title}`,
+            `   URL: ${r.file}`,
+            `   Score: ${r.score.toFixed(3)}  Docid: #${r.docid}`,
+            `   ${snippet.snippet}`,
+          ].join("\n");
+        })
+        .join("\n\n");
 
-      return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
-      };
-    }
+      return { content: [{ type: "text", text }] };
+    },
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_get (Retrieve document)
+  // Tool: get
   // ---------------------------------------------------------------------------
-
-  server.registerTool(
+  server.tool(
     "get",
+    "Retrieve a page by URL or docid (#abc123). Returns page metadata and extracted text content.",
     {
-      title: "Get Document",
-      description: "Retrieve the full content of a document by its file path or docid. Use paths or docids (#abc123) from search results. Suggests similar files if not found.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        file: z.string().describe("File path or docid from search results (e.g., 'pages/meeting.md', '#abc123', or 'pages/meeting.md:100' to start at line 100)"),
-        fromLine: z.number().optional().describe("Start from this line number (1-indexed)"),
-        maxLines: z.number().optional().describe("Maximum number of lines to return"),
-        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
-      },
+      page: z.string().describe("URL or docid (e.g. #abc123)"),
+      fromLine: z.number().int().min(1).optional().describe("Start from this line number"),
+      maxLines: z.number().int().min(1).optional().describe("Maximum lines to return"),
     },
-    async ({ file, fromLine, maxLines, lineNumbers }) => {
-      // Support :line suffix in `file` (e.g. "foo.md:120") when fromLine isn't provided
-      let parsedFromLine = fromLine;
-      let lookup = file;
-      const colonMatch = lookup.match(/:(\d+)$/);
-      if (colonMatch && colonMatch[1] && parsedFromLine === undefined) {
-        parsedFromLine = parseInt(colonMatch[1], 10);
-        lookup = lookup.slice(0, -colonMatch[0].length);
-      }
-
-      const result = await store.get(lookup, { includeBody: false });
+    async ({ page, fromLine, maxLines }) => {
+      const result = store.findPage(page, { includeBody: false });
 
       if ("error" in result) {
-        let msg = `Document not found: ${file}`;
-        if (result.similarFiles.length > 0) {
-          msg += `\n\nDid you mean one of these?\n${result.similarFiles.map(s => `  - ${s}`).join('\n')}`;
-        }
-        return {
-          content: [{ type: "text", text: msg }],
-          isError: true,
-        };
+        const msg = result.similarUrls.length
+          ? `Page not found: "${page}"\n\nSimilar URLs:\n${result.similarUrls.map(u => `  - ${u}`).join("\n")}`
+          : `Page not found: "${page}"`;
+        return { content: [{ type: "text", text: msg }], isError: true };
       }
 
-      const body = await store.getDocumentBody(result.filepath, { fromLine: parsedFromLine, maxLines }) ?? "";
-      let text = body;
-      if (lineNumbers) {
-        const startLine = parsedFromLine || 1;
-        text = addLineNumbers(text, startLine);
-      }
-      if (result.context) {
-        text = `<!-- Context: ${result.context} -->\n\n` + text;
+      let body = store.getPageBody(result, fromLine, maxLines) ?? "(no content)";
+      if (fromLine || maxLines) {
+        body = addLineNumbers(body, fromLine ?? 1);
       }
 
-      return {
-        content: [{
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.displayPath)}`,
-            name: result.displayPath,
-            title: result.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        }],
-      };
-    }
-  );
+      const header = [
+        `Title: ${result.title}`,
+        `URL: ${result.url}`,
+        `Docid: #${result.docid}`,
+        `Browsers: ${result.browsers.join(", ") || "unknown"}`,
+        `Visits: ${result.visitCount}`,
+        `Fetched: ${result.fetchedAt ?? "pending"}`,
+        `Body length: ${result.bodyLength} bytes`,
+        `---`,
+      ].join("\n");
 
-  // ---------------------------------------------------------------------------
-  // Tool: qmd_multi_get (Retrieve multiple documents)
-  // ---------------------------------------------------------------------------
-
-  server.registerTool(
-    "multi_get",
-    {
-      title: "Multi-Get Documents",
-      description: "Retrieve multiple documents by glob pattern (e.g., 'journals/2025-05*.md') or comma-separated list. Skips files larger than maxBytes.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
-        pattern: z.string().describe("Glob pattern or comma-separated list of file paths"),
-        maxLines: z.number().optional().describe("Maximum lines per file"),
-        maxBytes: z.number().optional().default(10240).describe("Skip files larger than this (default: 10240 = 10KB)"),
-        lineNumbers: z.boolean().optional().default(false).describe("Add line numbers to output (format: 'N: content')"),
-      },
+      return { content: [{ type: "text", text: `${header}\n${body}` }] };
     },
-    async ({ pattern, maxLines, maxBytes, lineNumbers }) => {
-      const { docs, errors } = await store.multiGet(pattern, { includeBody: true, maxBytes: maxBytes || DEFAULT_MULTI_GET_MAX_BYTES });
-
-      if (docs.length === 0 && errors.length === 0) {
-        return {
-          content: [{ type: "text", text: `No files matched pattern: ${pattern}` }],
-          isError: true,
-        };
-      }
-
-      const content: ({ type: "text"; text: string } | { type: "resource"; resource: { uri: string; name: string; title?: string; mimeType: string; text: string } })[] = [];
-
-      if (errors.length > 0) {
-        content.push({ type: "text", text: `Errors:\n${errors.join('\n')}` });
-      }
-
-      for (const result of docs) {
-        if (result.skipped) {
-          content.push({
-            type: "text",
-            text: `[SKIPPED: ${result.doc.displayPath} - ${result.skipReason}. Use 'qmd_get' with file="${result.doc.displayPath}" to retrieve.]`,
-          });
-          continue;
-        }
-
-        let text = result.doc.body || "";
-        if (maxLines !== undefined) {
-          const lines = text.split("\n");
-          text = lines.slice(0, maxLines).join("\n");
-          if (lines.length > maxLines) {
-            text += `\n\n[... truncated ${lines.length - maxLines} more lines]`;
-          }
-        }
-        if (lineNumbers) {
-          text = addLineNumbers(text);
-        }
-        if (result.doc.context) {
-          text = `<!-- Context: ${result.doc.context} -->\n\n` + text;
-        }
-
-        content.push({
-          type: "resource",
-          resource: {
-            uri: `qmd://${encodeQmdPath(result.doc.displayPath)}`,
-            name: result.doc.displayPath,
-            title: result.doc.title,
-            mimeType: "text/markdown",
-            text,
-          },
-        });
-      }
-
-      return { content };
-    }
   );
 
   // ---------------------------------------------------------------------------
-  // Tool: qmd_status (Index status)
+  // Tool: recent
   // ---------------------------------------------------------------------------
+  server.tool(
+    "recent",
+    "List recently visited pages from your browser history.",
+    {
+      limit: z.number().int().min(1).max(100).optional().describe("Max results (default 20)"),
+      browser: z.string().optional().describe("Restrict to a specific browser"),
+    },
+    async ({ limit, browser }) => {
+      const n = limit ?? 20;
+      let query = `
+        SELECT
+          p.url, p.title, p.hash, p.fetch_status, p.modified_at,
+          (SELECT GROUP_CONCAT(DISTINCT ps.browser) FROM page_sources ps WHERE ps.page_id = p.id) as browsers_csv,
+          (SELECT COALESCE(SUM(ps.visit_count), 0) FROM page_sources ps WHERE ps.page_id = p.id) as visit_count,
+          (SELECT MAX(ps.last_visit) FROM page_sources ps WHERE ps.page_id = p.id) as last_visit
+        FROM pages p
+        WHERE p.active = 1 AND p.fetch_status = 'fetched'
+      `;
+      const params: (string | number)[] = [];
 
-  server.registerTool(
+      if (browser) {
+        query += ` AND EXISTS (SELECT 1 FROM page_sources ps WHERE ps.page_id = p.id AND ps.browser = ?)`;
+        params.push(browser);
+      }
+
+      query += ` ORDER BY last_visit DESC NULLS LAST LIMIT ?`;
+      params.push(n);
+
+      const rows = store.db.prepare(query).all(...params) as {
+        url: string; title: string; hash: string | null;
+        fetch_status: string; modified_at: string;
+        browsers_csv: string | null; visit_count: number;
+        last_visit: string | null;
+      }[];
+
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: "No recently visited pages found." }] };
+      }
+
+      const text = rows
+        .map((r, i) => {
+          const browsers = r.browsers_csv ? r.browsers_csv.split(",").join(", ") : "unknown";
+          const docid = r.hash ? `#${r.hash.slice(0, 6)}` : "";
+          return `${i + 1}. ${r.title}\n   ${r.url}\n   Browsers: ${browsers}  Visits: ${r.visit_count}  ${docid}`;
+        })
+        .join("\n\n");
+
+      return { content: [{ type: "text", text }] };
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: status
+  // ---------------------------------------------------------------------------
+  server.tool(
     "status",
-    {
-      title: "Index Status",
-      description: "Show the status of the QMD index: collections, document counts, and health information.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {},
-    },
+    "Show the current state of the planet-capture index: page counts, browsers, embedding status.",
+    {},
     async () => {
-      const status: StatusResult = await store.getStatus();
-
-      const summary = [
-        `QMD Index Status:`,
-        `  Total documents: ${status.totalDocuments}`,
-        `  Needs embedding: ${status.needsEmbedding}`,
-        `  Vector index: ${status.hasVectorIndex ? 'yes' : 'no'}`,
-        `  Collections: ${status.collections.length}`,
+      const s = store.getStatus();
+      const lines = [
+        `Pages: ${s.totalPages} total, ${s.fetchedPages} fetched, ${s.pendingPages} pending, ${s.failedPages} failed`,
+        `Embeddings: ${s.needsEmbedding} pages need embedding, vector index ${s.hasVectorIndex ? "available" : "not built"}`,
       ];
 
-      for (const col of status.collections) {
-        summary.push(`    - ${col.name}: ${col.path} (${col.documents} docs)`);
+      if (s.browsers.length > 0) {
+        lines.push("", "Browsers:");
+        for (const b of s.browsers) {
+          lines.push(`  ${b.name}: ${b.pages} pages (last synced: ${b.lastSyncedAt ?? "never"})`);
+        }
       }
 
-      return {
-        content: [{ type: "text", text: summary.join('\n') }],
-        structuredContent: status,
-      };
-    }
+      if (s.lastRun) {
+        const d = s.lastRun;
+        lines.push("", `Last run: ${d.started_at} — discovered ${d.urls_discovered ?? 0}, fetched ${d.urls_fetched ?? 0}, errors ${d.urls_failed ?? 0}`);
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: multi_get
+  // ---------------------------------------------------------------------------
+  server.tool(
+    "multi_get",
+    "Retrieve multiple pages by their docids. Pass a comma-separated list of docids.",
+    {
+      docids: z.string().describe("Comma-separated docids, e.g. '#abc123, #def456'"),
+      maxLines: z.number().int().min(1).optional().describe("Max lines per page (default unlimited)"),
+      maxBytes: z.number().int().min(1).optional().describe("Skip pages larger than this (default 10KB)"),
+    },
+    async ({ docids, maxLines, maxBytes }) => {
+      const ids = docids.split(",").map(d => d.trim()).filter(Boolean);
+      const limit = maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
+      const parts: string[] = [];
+
+      for (const id of ids) {
+        const result = store.findPage(id, { includeBody: false });
+        if ("error" in result) {
+          parts.push(`--- ${id} ---\nNot found\n`);
+          continue;
+        }
+        if (result.bodyLength > limit) {
+          parts.push(`--- ${result.url} (#${result.docid}) ---\nSkipped: ${result.bodyLength} bytes exceeds limit of ${limit}\n`);
+          continue;
+        }
+        let body = store.getPageBody(result, undefined, maxLines) ?? "(no content)";
+        if (maxLines) {
+          body = addLineNumbers(body);
+        }
+        parts.push(`--- ${result.url} (#${result.docid}) ---\n${result.title}\n\n${body}\n`);
+      }
+
+      return { content: [{ type: "text", text: parts.join("\n") }] };
+    },
   );
 
   return server;
 }
 
 // =============================================================================
-// Transport: stdio (default)
+// Transport: stdio
 // =============================================================================
 
-export async function startMcpServer(): Promise<void> {
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
+export async function startStdio(dbPath?: string): Promise<void> {
+  const store = createStore(dbPath);
+  const llm = new LlamaCpp({
+    inactivityTimeoutMs: 5 * 60 * 1000,
+    disposeModelsOnInactivity: true,
   });
-  const server = await createMcpServer(store);
+  store.llm = llm;
+
+  const server = createMcpServer(store);
   const transport = new StdioServerTransport();
+
+  process.on("SIGINT", async () => {
+    await server.close();
+    await llm.dispose();
+    store.close();
+    process.exit(0);
+  });
+
   await server.connect(transport);
 }
 
 // =============================================================================
-// Transport: Streamable HTTP
+// Transport: HTTP (Streamable HTTP)
 // =============================================================================
 
-export type HttpServerHandle = {
-  httpServer: import("http").Server;
-  port: number;
-  stop: () => Promise<void>;
-};
+export async function startHttp(port: number = 8181, dbPath?: string): Promise<void> {
+  const store = createStore(dbPath);
+  const llm = new LlamaCpp({
+    inactivityTimeoutMs: 5 * 60 * 1000,
+    disposeModelsOnInactivity: true,
+  });
+  store.llm = llm;
 
-/**
- * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
- */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  const configPath = getConfigPath();
-  const store = await createStore({
-    dbPath: getDefaultDbPath(),
-    ...(existsSync(configPath) ? { configPath } : {}),
+  const server = createMcpServer(store);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
   });
 
-  // Pre-fetch default collection names for REST endpoint
-  const defaultCollectionNames = await store.getDefaultCollectionNames();
+  await server.connect(transport);
 
-  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
-  // The store is shared — it's stateless SQLite, safe for concurrent access.
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
-
-  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
-      onsessioninitialized: (sessionId: string) => {
-        sessions.set(sessionId, transport);
-        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
-      },
-    });
-    const server = await createMcpServer(store);
-    await server.connect(transport);
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
-
-    return transport;
-  }
-
-  const startTime = Date.now();
-  const quiet = options?.quiet ?? false;
-
-  /** Format timestamp for request logging */
-  function ts(): string {
-    return new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
-  }
-
-  /** Extract a human-readable label from a JSON-RPC body */
-  function describeRequest(body: any): string {
-    const method = body?.method ?? "unknown";
-    if (method === "tools/call") {
-      const tool = body.params?.name ?? "?";
-      const args = body.params?.arguments;
-      // Show query string if present, truncated
-      if (args?.query) {
-        const q = String(args.query).slice(0, 80);
-        return `tools/call ${tool} "${q}"`;
-      }
-      if (args?.path) return `tools/call ${tool} ${args.path}`;
-      if (args?.pattern) return `tools/call ${tool} ${args.pattern}`;
-      return `tools/call ${tool}`;
-    }
-    return method;
-  }
-
-  function log(msg: string): void {
-    if (!quiet) console.error(msg);
-  }
-
-  // Helper to collect request body
-  async function collectBody(req: IncomingMessage): Promise<string> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    return Buffer.concat(chunks).toString();
-  }
-
-  const httpServer = createServer(async (nodeReq: IncomingMessage, nodeRes: ServerResponse) => {
-    const reqStart = Date.now();
-    const pathname = nodeReq.url || "/";
-
-    try {
-      if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
-        nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(body);
-        log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
-        return;
-      }
-
-      // REST endpoint: POST /search — structured search without MCP protocol
-      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
-      if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody);
-
-        // Validate required fields
-        if (!params.searches || !Array.isArray(params.searches)) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
-          return;
-        }
-
-        // Map to internal format
-        const queries: ExpandedQuery[] = params.searches.map((s: any) => ({
-          type: s.type as 'lex' | 'vec' | 'hyde',
-          query: String(s.query || ""),
-        }));
-
-        // Use default collections if none specified
-        const effectiveCollections = params.collections ?? defaultCollectionNames;
-
-        const results = await store.search({
-          queries,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit: params.limit ?? 10,
-          minScore: params.minScore ?? 0,
-          intent: params.intent,
-        });
-
-        // Use first lex or vec query for snippet extraction
-        const primaryQuery = params.searches.find((s: any) => s.type === 'lex')?.query
-          || params.searches.find((s: any) => s.type === 'vec')?.query
-          || params.searches[0]?.query || "";
-
-        const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: r.context,
-            snippet: addLineNumbers(snippet, line),
-          };
-        });
-
-        nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
-        return;
-      }
-
-      if (pathname === "/mcp" && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
-        const body = JSON.parse(rawBody);
-        const label = describeRequest(body);
-        const url = `http://localhost:${port}${pathname}`;
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(nodeReq.headers)) {
-          if (typeof v === "string") headers[k] = v;
-        }
-
-        // Route to existing session or create new one on initialize
-        const sessionId = headers["mcp-session-id"];
-        let transport: WebStandardStreamableHTTPServerTransport;
-
-        if (sessionId) {
-          const existing = sessions.get(sessionId);
-          if (!existing) {
-            nodeRes.writeHead(404, { "Content-Type": "application/json" });
-            nodeRes.end(JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32001, message: "Session not found" },
-              id: body?.id ?? null,
-            }));
-            return;
-          }
-          transport = existing;
-        } else if (isInitializeRequest(body)) {
-          transport = await createSession();
-        } else {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: body?.id ?? null,
-          }));
-          return;
-        }
-
-        const request = new Request(url, { method: "POST", headers, body: rawBody });
-        const response = await transport.handleRequest(request, { parsedBody: body });
-
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
-        log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
-        return;
-      }
-
-      if (pathname === "/mcp") {
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(nodeReq.headers)) {
-          if (typeof v === "string") headers[k] = v;
-        }
-
-        // GET/DELETE must have a valid session
-        const sessionId = headers["mcp-session-id"];
-        if (!sessionId) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: Missing session ID" },
-            id: null,
-          }));
-          return;
-        }
-        const transport = sessions.get(sessionId);
-        if (!transport) {
-          nodeRes.writeHead(404, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32001, message: "Session not found" },
-            id: null,
-          }));
-          return;
-        }
-
-        const url = `http://localhost:${port}${pathname}`;
-        const rawBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD" ? await collectBody(nodeReq) : undefined;
-        const request = new Request(url, { method: nodeReq.method || "GET", headers, ...(rawBody ? { body: rawBody } : {}) });
-        const response = await transport.handleRequest(request);
-        nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
-        nodeRes.end(Buffer.from(await response.arrayBuffer()));
-        return;
-      }
-
-      nodeRes.writeHead(404);
-      nodeRes.end("Not Found");
-    } catch (err) {
-      console.error("HTTP handler error:", err);
-      nodeRes.writeHead(500);
-      nodeRes.end("Internal Server Error");
+  const httpServer = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", `http://localhost:${port}`);
+    if (url.pathname === "/mcp") {
+      await transport.handleRequest(req, res);
+    } else {
+      res.writeHead(404);
+      res.end("Not Found");
     }
   });
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+  httpServer.listen(port, () => {
+    console.error(`planet-capture MCP server listening on http://localhost:${port}/mcp`);
   });
 
-  const actualPort = (httpServer.address() as import("net").AddressInfo).port;
-
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
-    for (const transport of sessions.values()) {
-      await transport.close();
-    }
-    sessions.clear();
+  const shutdown = async () => {
     httpServer.close();
-    await store.close();
+    await server.close();
+    await llm.dispose();
+    store.close();
+    process.exit(0);
   };
 
-  process.on("SIGTERM", async () => {
-    console.error("Shutting down (SIGTERM)...");
-    await stop();
-    process.exit(0);
-  });
-  process.on("SIGINT", async () => {
-    console.error("Shutting down (SIGINT)...");
-    await stop();
-    process.exit(0);
-  });
-
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
-  return { httpServer, port: actualPort, stop };
-}
-
-// Run if this is the main module
-if (fileURLToPath(import.meta.url) === process.argv[1] || process.argv[1]?.endsWith("/server.ts") || process.argv[1]?.endsWith("/server.js")) {
-  startMcpServer().catch(console.error);
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }

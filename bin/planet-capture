@@ -1,0 +1,22 @@
+#!/bin/sh
+# Resolve symlinks so global installs (npm link / npm install -g) can find the
+# actual package directory instead of the global bin directory.
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *) SOURCE="$SOURCE_DIR/$TARGET" ;;
+  esac
+done
+
+DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+if [ -f "$DIR/package-lock.json" ]; then
+  exec node "$DIR/dist/cli/planet-capture.js" "$@"
+elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
+  exec bun "$DIR/dist/cli/planet-capture.js" "$@"
+else
+  exec node "$DIR/dist/cli/planet-capture.js" "$@"
+fi
